@@ -31,9 +31,9 @@ Panel {
   property bool measured: false
   property bool discharging: false
   property int percent: -1
-  property string status: "unknown"
+  property string batteryStatus: "unknown"
   property bool quiet: false
-  property var top: []
+  property var consumers: []
   property real updatedAt: 0
 
   readonly property bool stale: updatedAt > 0
@@ -74,7 +74,7 @@ Panel {
         root.discharging = s.discharging === true
         var p = Number(s.percent)
         root.percent = isFinite(p) ? p : -1
-        root.status = typeof s.status === "string" ? s.status : "unknown"
+        root.batteryStatus = typeof s.status === "string" ? s.status : "unknown"
         root.quiet = s.quiet === true
         var at = Number(s.at)
         root.updatedAt = isFinite(at) ? at : 0
@@ -87,7 +87,7 @@ Panel {
             mwh: isFinite(m) ? m : 0
           })
         }
-        root.top = list
+        root.consumers = list
       } catch (error) {
         // A half-written file is transient; keep the last good reading.
       }
@@ -152,7 +152,7 @@ Panel {
         Text {
           visible: root.percent >= 0
           width: panelColumn.width
-          text: "Battery " + root.percent + "% · " + root.status
+          text: "Battery " + root.percent + "% · " + root.batteryStatus
           textFormat: Text.PlainText
           color: root.panelText
           opacity: 0.72
@@ -193,14 +193,14 @@ Panel {
         }
 
         PanelSectionHeader {
-          visible: root.top.length > 0
+          visible: root.consumers.length > 0
           text: "Using it now"
           foreground: root.panelText
           fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         }
 
         Repeater {
-          model: root.top
+          model: root.consumers
 
           Item {
             required property var modelData
