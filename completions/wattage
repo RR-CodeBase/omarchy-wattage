@@ -1,0 +1,71 @@
+# bash completion for wattage
+_wattage_bar_widgets() {
+  # Bar widget ids, so `bisect` and `quiet add` complete what is actually
+  # installed. Silent if the config is missing or unreadable.
+  python3 - <<'PY' 2>/dev/null
+import json, pathlib
+try:
+    layout = json.loads((pathlib.Path.home() / ".config/omarchy/shell.json").read_text())["bar"]["layout"]
+except Exception:
+    raise SystemExit(0)
+for section in layout.values():
+    for item in section:
+        if isinstance(item, dict) and item.get("id"):
+            print(item["id"])
+PY
+}
+
+_wattage() {
+  local cur prev words cword
+  _init_completion 2>/dev/null || {
+    cur=${COMP_WORDS[COMP_CWORD]}
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+    cword=$COMP_CWORD
+  }
+
+  local verbs="sample now top bisect plugins helpers quiet service doctor"
+  local windows="1h 6h 24h today 7d 14d"
+
+  if (( cword == 1 )); then
+    COMPREPLY=($(compgen -W "$verbs --help" -- "$cur"))
+    return
+  fi
+
+  # Options that take a value, handled before the per-verb cases.
+  case "$prev" in
+  --since)   COMPREPLY=($(compgen -W "$windows" -- "$cur")); return ;;
+  --limit)   COMPREPLY=($(compgen -W "5 10 12 20" -- "$cur")); return ;;
+  --seconds) COMPREPLY=($(compgen -W "10 15 20 30 60" -- "$cur")); return ;;
+  esac
+
+  case "${COMP_WORDS[1]}" in
+  sample)
+    COMPREPLY=($(compgen -W "--daemon --json" -- "$cur")) ;;
+  now | helpers)
+    COMPREPLY=($(compgen -W "--json" -- "$cur")) ;;
+  top)
+    COMPREPLY=($(compgen -W "--since --limit --json" -- "$cur")) ;;
+  bisect)
+    if (( cword == 2 )); then
+      COMPREPLY=($(compgen -W "$(_wattage_bar_widgets)" -- "$cur"))
+    else
+      COMPREPLY=($(compgen -W "--seconds" -- "$cur"))
+    fi ;;
+  plugins)
+    if [[ $cur == -* ]] || [[ ${COMP_WORDS[*]} != *--only* ]]; then
+      COMPREPLY=($(compgen -W "--measure --only --seconds --yes --json" -- "$cur"))
+    else
+      # --only takes a list of ids.
+      COMPREPLY=($(compgen -W "$(_wattage_bar_widgets)" -- "$cur"))
+    fi ;;
+  quiet)
+    if (( cword == 2 )); then
+      COMPREPLY=($(compgen -W "on off toggle auto status add remove suggest" -- "$cur"))
+    elif [[ ${COMP_WORDS[2]} == add || ${COMP_WORDS[2]} == remove ]]; then
+      COMPREPLY=($(compgen -W "$(_wattage_bar_widgets)" -- "$cur"))
+    fi ;;
+  service)
+    (( cword == 2 )) && COMPREPLY=($(compgen -W "install remove status" -- "$cur")) ;;
+  esac
+}
+complete -F _wattage wattage

@@ -155,14 +155,18 @@ for nothing.
 omarchy plugin add https://github.com/RR-CodeBase/omarchy-wattage.git --enable
 ```
 
-Then start the sampler, which is what gives it anything to report:
+Then run `install.sh`, which starts the background sampler — the thing that
+gives Wattage anything to report — and links `wattage` into `~/.local/bin` with
+bash completion, so the commands below work as written:
 
 ```sh
-~/.config/omarchy/plugins/io.github.rr-codebase.wattage/bin/wattage service install
+~/.config/omarchy/plugins/io.github.rr-codebase.wattage/install.sh
 ```
 
-Or from a clone, `git clone` then `./install.sh`, which registers the plugin,
-places the widget and installs the sampler in one go.
+It is safe to re-run. If you would rather not have the CLI on your PATH, just
+`bin/wattage service install` starts the sampler on its own. Working from a
+clone instead? `git clone`, then `./install.sh` does the whole lot: registers
+the plugin, places the widget, installs the sampler.
 
 ## Usage
 
@@ -193,7 +197,8 @@ covers them.
 ```
 
 That stops and removes the sampler service, restores anything quiet mode had
-turned off, and removes the plugin. `omarchy plugin remove
+turned off, removes the `wattage` symlink and completion, and removes the
+plugin. `omarchy plugin remove
 io.github.rr-codebase.wattage` on its own leaves the service running. Your
 history stays at `~/.local/state/omarchy/wattage.db` either way.
 

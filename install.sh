@@ -11,6 +11,8 @@ PLUGIN_ID="io.github.rr-codebase.wattage"
 PLUGINS_DIR="$HOME/.config/omarchy/plugins"
 SECTION="right"
 WITH_SERVICE=1
+BIN_LINK="$HOME/.local/bin/wattage"
+COMPLETION="$HOME/.local/share/bash-completion/completions/wattage"
 
 usage() {
   cat <<USAGE
@@ -34,6 +36,8 @@ uninstall() {
   [[ -x $CLI ]] || CLI="$SCRIPT_DIR/bin/wattage"
   "$CLI" quiet off >/dev/null 2>&1 || true
   "$CLI" service remove >/dev/null 2>&1 && ok "sampler removed"
+  [[ -L $BIN_LINK || -f $BIN_LINK ]] && { rm -f "$BIN_LINK"; ok "removed ${BIN_LINK/#$HOME/\~}"; }
+  [[ -f $COMPLETION ]] && { rm -f "$COMPLETION"; ok "removed shell completion"; }
   if [[ -d "$PLUGINS_DIR/$PLUGIN_ID" ]]; then
     omarchy plugin remove "$PLUGIN_ID" --yes >/dev/null 2>&1 || true
     ok "plugin removed"
@@ -84,6 +88,24 @@ omarchy bar put "$PLUGIN_ID" "$SECTION" >/dev/null 2>&1 \
 CLI="$PLUGINS_DIR/$PLUGIN_ID/bin/wattage"
 [[ -x $CLI ]] || CLI="$SCRIPT_DIR/bin/wattage"
 
+# The README documents `wattage ...` as a bare command, so put it on PATH. The
+# script itself stays in the plugin; this is only a link to it.
+mkdir -p "$(dirname "$BIN_LINK")"
+ln -sfn "$CLI" "$BIN_LINK"
+ok "wattage linked into ${BIN_LINK/#$HOME/\~}"
+# Only advertise the short form if it will actually resolve.
+PRETTY_CLI="$CLI"
+case ":$PATH:" in
+  *":${BIN_LINK%/*}:"*) PRETTY_CLI="wattage" ;;
+  *) warn "${BIN_LINK%/*} is not on your PATH - add it to use \`wattage\` directly" ;;
+esac
+
+if [[ -f $SCRIPT_DIR/completions/wattage ]]; then
+  mkdir -p "$(dirname "$COMPLETION")"
+  install -m 0644 "$SCRIPT_DIR/completions/wattage" "$COMPLETION"
+  ok "shell completion installed"
+fi
+
 if ((WITH_SERVICE)); then
   "$CLI" service install >/dev/null && ok "sampler started (every 20s, Nice 19)"
 fi
@@ -91,5 +113,5 @@ fi
 echo
 "$CLI" doctor || true
 echo
-echo "  Unplug for a few minutes, then:  $CLI top"
+echo "  Unplug for a few minutes, then:  $PRETTY_CLI top"
 echo
