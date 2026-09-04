@@ -754,6 +754,11 @@ def cmd_doctor(args) -> int:
             ok = False
         print(f"[{'OK  ' if good else 'FAIL'}] {label}{(' - ' + detail) if detail else ''}")
 
+    def pending(label, done, detail=""):
+        """Not broken, just not observed yet. Reporting "FAIL" for something
+        that only needs time on battery sends people debugging nothing."""
+        print(f"[{'OK  ' if done else '....'}] {label}{(' - ' + detail) if detail else ''}")
+
     system = System()
     power = system.power()
     check("Battery found", bool(power["battery"]), power["battery"] or "no battery in /sys")
@@ -771,10 +776,12 @@ def cmd_doctor(args) -> int:
     check("Database", True, f"{DB_FILE} ({n} samples)")
 
     s = settings()
-    check("Idle floor learned", float(s.get("idleWatts") or 0) > 0,
-          f"{s.get('idleWatts')} W" if s.get("idleWatts") else "run on battery for a few minutes")
-    check("Watts per CPU-second learned", float(s.get("wattsPerCpuSecond") or 0) > 0,
-          f"{s.get('wattsPerCpuSecond')}" if s.get("wattsPerCpuSecond") else "needs time on battery")
+    pending("Idle floor learned", float(s.get("idleWatts") or 0) > 0,
+            f"{s.get('idleWatts')} W" if s.get("idleWatts")
+            else "waiting for a few idle minutes on battery")
+    pending("Watts per CPU-second learned", float(s.get("wattsPerCpuSecond") or 0) > 0,
+            f"{s.get('wattsPerCpuSecond')} W/s" if s.get("wattsPerCpuSecond")
+            else "waiting for some busy minutes on battery")
 
     r = subprocess.run(["systemctl", "--user", "is-active", "wattage.service"],
                        capture_output=True, text=True)
@@ -783,6 +790,8 @@ def cmd_doctor(args) -> int:
 
     print()
     print("Ready." if ok else "Some checks need attention - see above.")
+    if ok:
+        print("Lines marked .... just need time on battery; nothing to do.")
     return 0 if ok else 1
 
 
