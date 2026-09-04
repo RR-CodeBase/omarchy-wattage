@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""wattage - not how much battery is left, but what ate it.
+
+Every battery widget reports the same number the kernel already knows. This one
+answers the question people actually ask at 3pm: what is draining this thing?
+
+There is no per-process power meter in any laptop. What there is: the battery's
+own reported draw, which is ground truth for the whole machine, and per-process
+CPU time. Wattage samples both and divides the machine's *active* draw between
+processes in proportion to the CPU they burned, leaving the idle floor
+unattributed. That is an estimate, and the UI says so -- but it is an estimate
+built on a real measurement, and it is enough to find the process costing you
+an hour of runtime.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "wattage"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy"
+
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+DB_FILE = Path(os.environ.get("WATTAGE_DB") or (STATE_DIR / "wattage.db"))
+STATE_FILE = STATE_DIR / "wattage.json"
+
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+RETAIN_DAYS = 14
+
+DEFAULT_SETTINGS = {
+    "interval": 20,          # seconds between samples
+    "idleWatts": 0.0,        # learned floor; 0 means "not learned yet"
+    "wattsPerCpuSecond": 0.0,  # learned, used to estimate while on AC
+    "quiet": {
+        "auto": False,       # quieten automatically on battery
+        "belowPercent": 100,  # ...when the battery is at or below this
+        "plugins": [],       # plugin ids to disable
+    },
+}
+
+# Kernel threads have an empty /proc/<pid>/cmdline. They are the machine
+# breathing rather than anything a person started, and left in they crowd the
+# list with rcu_preempt and napi/phy0-0 instead of answering the question.
+def is_kernel_thread(proc_dir: Path) -> bool:
+    try:
+        return (proc_dir / "cmdline").read_bytes().strip(b"\x00") == b""
+    except OSError:
+        return True
+
+
+# ---------------------------------------------------------------- utilities
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def load_json(path: Path, fallback):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return fallback
+
+
+def settings() -> dict:
+    s = json.loads(json.dumps(DEFAULT_SETTINGS))
+    user = load_json(SETTINGS_FILE, {}) or {}
+    for key, value in user.items():
+        if isinstance(value, dict) and isinstance(s.get(key), dict):
+            s[key].update(value)
+        else:
+            s[key] = value
+    return s
+
+
+def save_settings(s: dict) -> None:
+    atomic_write(SETTINGS_FILE, json.dumps(s, indent=2) + "\n")
+
+
+def human_watts(w: float) -> str:
+    if w is None:
+        return "--"
+    return f"{w:.1f} W" if w >= 1 else f"{w * 1000:.0f} mW"
+
+
+def human_energy(mwh: float) -> str:
+    if mwh >= 1000:
+        return f"{mwh / 1000:.2f} Wh"
+    return f"{mwh:.0f} mWh"
+
+
+SYSTEMD_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})")
+# Trailing instance ids systemd appends: -1326, -ec06e741, -94b95655.
+INSTANCE_SUFFIX = re.compile(r"-(?:[0-9]+|[0-9a-f]{6,})$")
+# Per-window scopes some apps create: ghostty-surface-transient-135447.
+WINDOW_SUFFIX = re.compile(r"^(.+?)-(?:surface|transient|window|tab)\b")
+# Launchers that prefix the scope with their own name.
+LAUNCHER_PREFIXES = ("Hyprland-", "uwsm-", "app-daemon-")
+
+
+def app_from_cgroup(cgroup: str) -> str | None:
+    """The app a cgroup path belongs to, or None if it does not name one.
+
+    Real examples this has to survive, all taken from a running machine:
+
+        app-ghostty-surface-transient-135447.scope   -> ghostty
+        app-Hyprland-brave-ec06e741.scope            -> brave
+        app-Hyprland-xdg\\x2dterminal\\x2dexec-94b9.scope -> xdg-terminal-exec
+        app-org.chromium.Chromium-2053133.scope      -> Chromium
+        app-1password@autostart.service              -> 1password
+        wayland-wm@hyprland.desktop.service          -> None (use comm)
+    """
+    leaf = cgroup.strip().split("/")[-1]
+    leaf = leaf.replace(" (deleted)", "").strip()
+    leaf = SYSTEMD_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), leaf)
+    if not leaf.startswith("app-"):
+        return None
+    name = leaf[4:]
+    for suffix in (".scope", ".service", ".slice"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    name = name.split("@", 1)[0]          # 1password@autostart
+    for prefix in LAUNCHER_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    name = INSTANCE_SUFFIX.sub("", name)
+    m = WINDOW_SUFFIX.match(name)
+    if m:
+        name = m.group(1)
+    if "." in name and not name.startswith("."):
+        # org.chromium.Chromium -> Chromium
+        tail = name.rsplit(".", 1)[-1]
+        if tail:
+            name = tail
+    return name or None
+
+
+# ---------------------------------------------------------------- the system
+
+class System:
+    """Everything Wattage reads from the machine, in one place so tests can
+    substitute a fake one."""
+
+    def __init__(self, proc="/proc", power_supply="/sys/class/power_supply"):
+        self.proc = Path(proc)
+        self.power_supply = Path(power_supply)
+
+    # ---- cpu
+
+    def cpu_total_jiffies(self) -> tuple[int, int]:
+        """(busy, total) jiffies across all cores."""
+        line = (self.proc / "stat").read_text().splitlines()[0]
+        parts = [int(x) for x in line.split()[1:]]
+        idle = parts[3] + (parts[4] if len(parts) > 4 else 0)   # idle + iowait
+        total = sum(parts)
+        return total - idle, total
+
+    def processes(self) -> dict[int, tuple[str, int]]:
+        """pid -> (app name, cpu jiffies used so far)."""
+        out = {}
+        for entry in self.proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if is_kernel_thread(entry):
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            # comm can contain spaces and parentheses, so split on the last ')'
+            close = stat.rfind(")")
+            open_paren = stat.find("(")
+            if close < 0 or open_paren < 0:
+                continue
+            comm = stat[open_paren + 1:close]
+            fields = stat[close + 2:].split()
+            if len(fields) < 13:
+                continue
+            try:
+                jiffies = int(fields[11]) + int(fields[12])   # utime + stime
+            except ValueError:
+                continue
+            out[pid] = (self.app_name(pid, comm), jiffies)
+        return out
+
+    def app_name(self, pid: int, comm: str) -> str:
+        """Group by the systemd scope when there is one: that is the unit a
+        person recognises ("ghostty"), where comm is often a helper thread."""
+        try:
+            cgroup = (self.proc / str(pid) / "cgroup").read_text().strip()
+        except OSError:
+            return comm
+        return app_from_cgroup(cgroup) or comm
+
+    # ---- power
+
+    def batteries(self):
+        if not self.power_supply.exists():
+            return []
+        return sorted(
+            p for p in self.power_supply.iterdir()
+            if (p / "type").exists() and (p / "type").read_text().strip() == "Battery"
+            and (p / "status").exists()
+        )
+
+    def _read_int(self, path: Path):
+        try:
+            return int(path.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def power(self) -> dict:
+        """Watts the machine is drawing, and whether that number is real.
+
+        `power_now` is only meaningful while discharging; on AC most firmware
+        reports zero, which is not the same as using no power.
+        """
+        for bat in self.batteries():
+            status = (bat / "status").read_text().strip()
+            uw = self._read_int(bat / "power_now")
+            if uw is None:
+                current = self._read_int(bat / "current_now")
+                voltage = self._read_int(bat / "voltage_now")
+                if current is not None and voltage is not None:
+                    uw = abs(current) * voltage // 1_000_000
+            energy = self._read_int(bat / "energy_now")
+            full = self._read_int(bat / "energy_full")
+            capacity = self._read_int(bat / "capacity")
+            discharging = status == "Discharging"
+            watts = (abs(uw) / 1_000_000) if uw else 0.0
+            return {
+                "battery": bat.name,
+                "status": status,
+                "discharging": discharging,
+                "watts": watts if discharging and watts > 0 else None,
+                "measured": bool(discharging and watts > 0),
+                "percent": capacity,
+                "energy_mwh": (energy / 1000) if energy else None,
+                "full_mwh": (full / 1000) if full else None,
+            }
+        return {"battery": None, "status": "unknown", "discharging": False,
+                "watts": None, "measured": False, "percent": None,
+                "energy_mwh": None, "full_mwh": None}
+
+
+# ---------------------------------------------------------------- storage
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS samples (
+  ts REAL PRIMARY KEY,
+  seconds REAL NOT NULL,
+  watts REAL,
+  measured INTEGER NOT NULL,
+  discharging INTEGER NOT NULL,
+  percent INTEGER,
+  busy_cpu REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage (
+  ts REAL NOT NULL,
+  app TEXT NOT NULL,
+  cpu_seconds REAL NOT NULL,
+  mwh REAL NOT NULL,
+  PRIMARY KEY (ts, app)
+);
+CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts);
+CREATE TABLE IF NOT EXISTS cursor (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  ts REAL, busy INTEGER, total INTEGER, pids TEXT
+);
+"""
+
+
+def db() -> sqlite3.Connection:
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def prune(conn) -> None:
+    cutoff = time.time() - RETAIN_DAYS * 86400
+    conn.execute("DELETE FROM usage WHERE ts < ?", (cutoff,))
+    conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+
+
+# ---------------------------------------------------------------- sampling
+
+def attribute(prev_pids, now_pids, active_watts, seconds):
+    """Split active watts between apps in proportion to CPU burned.
+
+    A process that appeared since the last sample contributes only the CPU it
+    has used, and one that exited contributes nothing -- short-lived processes
+    are the known blind spot of any sampling approach, and pretending otherwise
+    would be worse than saying it.
+    """
+    per_app: dict[str, float] = {}
+    for pid, (app, jiffies) in now_pids.items():
+        before = prev_pids.get(pid)
+        if before is None:
+            continue
+        prev_app, prev_jiffies = before
+        delta = jiffies - prev_jiffies
+        if delta <= 0:
+            continue
+        per_app[app] = per_app.get(app, 0.0) + delta / CLK_TCK
+
+    total_cpu = sum(per_app.values())
+    rows = []
+    for app, cpu_s in per_app.items():
+        share = (cpu_s / total_cpu) if total_cpu > 0 else 0.0
+        watts = (active_watts or 0.0) * share
+        mwh = watts * (seconds / 3600.0) * 1000.0
+        rows.append((app, cpu_s, mwh))
+    return rows, total_cpu
+
+
+def sample_once(system: System, conn, now: float | None = None) -> dict:
+    s = settings()
+    now = now if now is not None else time.time()
+    busy, total = system.cpu_total_jiffies()
+    pids = system.processes()
+    power = system.power()
+
+    row = conn.execute("SELECT ts, busy, total, pids FROM cursor WHERE id = 1").fetchone()
+    conn.execute(
+        "INSERT OR REPLACE INTO cursor (id, ts, busy, total, pids) VALUES (1, ?, ?, ?, ?)",
+        (now, busy, total, json.dumps({str(p): v for p, v in pids.items()})),
+    )
+
+    if row is None:
+        conn.commit()
+        return {"first": True, **power}
+
+    prev_ts, prev_busy, prev_total, prev_pids_json = row
+    seconds = now - prev_ts
+    if seconds <= 0 or seconds > 3600:
+        # A suspend, a clock jump, or a stale cursor: start again rather than
+        # attributing hours of drain to whatever happened to be running.
+        conn.commit()
+        return {"reset": True, **power}
+
+    prev_pids = {int(k): tuple(v) for k, v in json.loads(prev_pids_json).items()}
+
+    # Learn the idle floor and the cost of a CPU-second while we can measure.
+    idle_watts = float(s.get("idleWatts") or 0.0)
+    watts = power["watts"]
+    busy_cpu_seconds = max(0.0, (busy - prev_busy) / CLK_TCK)
+
+    if power["measured"] and watts:
+        if busy_cpu_seconds / max(seconds, 1e-9) < 0.05:
+            # Nearly idle: this reading is a good estimate of the floor.
+            idle_watts = watts if idle_watts <= 0 else min(idle_watts, watts)
+            s["idleWatts"] = round(idle_watts, 3)
+            save_settings(s)
+        elif busy_cpu_seconds > 0 and idle_watts > 0:
+            per_cpu = max(0.0, watts - idle_watts) / busy_cpu_seconds
+            learned = float(s.get("wattsPerCpuSecond") or 0.0)
+            s["wattsPerCpuSecond"] = round(
+                per_cpu if learned <= 0 else (learned * 0.8 + per_cpu * 0.2), 3)
+            save_settings(s)
+        active = max(0.0, watts - idle_watts)
+    else:
+        # On AC there is no measurement to divide up. Fall back to what the
+        # machine taught us while it was on battery, and mark it estimated.
+        per_cpu = float(s.get("wattsPerCpuSecond") or 0.0)
+        active = per_cpu * busy_cpu_seconds if per_cpu > 0 else 0.0
+
+    rows, total_cpu = attribute(prev_pids, pids, active, seconds)
+
+    conn.execute(
+        "INSERT OR REPLACE INTO samples (ts, seconds, watts, measured, discharging, percent, busy_cpu)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (now, seconds, watts, int(power["measured"]), int(power["discharging"]),
+         power["percent"], total_cpu),
+    )
+    for app, cpu_s, mwh in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO usage (ts, app, cpu_seconds, mwh) VALUES (?, ?, ?, ?)",
+            (now, app, cpu_s, mwh))
+    prune(conn)
+    conn.commit()
+
+    top = sorted(rows, key=lambda r: (-r[2], -r[1]))[:5]
+    result = {
+        "seconds": round(seconds, 1),
+        "active_watts": round(active, 2),
+        "total_cpu_seconds": round(total_cpu, 2),
+        "top": [{"app": a, "cpu_seconds": round(c, 2), "mwh": round(m, 2)} for a, c, m in top],
+        **power,
+    }
+    write_state(result, top)
+    return result
+
+
+def write_state(result: dict, top) -> None:
+    atomic_write(STATE_FILE, json.dumps({
+        "watts": result.get("watts"),
+        "measured": result.get("measured"),
+        "discharging": result.get("discharging"),
+        "percent": result.get("percent"),
+        "status": result.get("status"),
+        "top": [{"app": a, "mwh": round(m, 2)} for a, _c, m in top],
+        "quiet": quiet_active(),
+        "at": time.time(),
+    }, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------- quiet mode
+
+QUIET_MARKER = STATE_DIR / "wattage-quiet.json"
+
+
+def quiet_active() -> bool:
+    return QUIET_MARKER.exists()
+
+
+def plugin_ids() -> list[str]:
+    try:
+        out = subprocess.run(["omarchy", "plugin", "list", "--json"],
+                             capture_output=True, text=True, timeout=15).stdout
+        return [p.get("id") for p in json.loads(out) if p.get("id")]
+    except Exception:
+        return []
+
+
+def set_quiet(on: bool) -> list[str]:
+    s = settings()
+    targets = [p for p in s["quiet"].get("plugins", []) if p]
+    touched = []
+    if on:
+        if quiet_active():
+            return []
+        for pid in targets:
+            r = subprocess.run(["omarchy", "plugin", "disable", pid],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                touched.append(pid)
+        atomic_write(QUIET_MARKER, json.dumps({"disabled": touched, "at": time.time()}))
+    else:
+        record = load_json(QUIET_MARKER, {}) or {}
+        for pid in record.get("disabled", []):
+            r = subprocess.run(["omarchy", "plugin", "enable", pid],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                touched.append(pid)
+        try:
+            QUIET_MARKER.unlink()
+        except OSError:
+            pass
+    return touched
+
+
+# ---------------------------------------------------------------- reporting
+
+WINDOWS = {"1h": 3600, "6h": 21600, "24h": 86400, "today": None, "7d": 604800, "14d": 1209600}
+
+
+def window_start(name: str) -> float:
+    if name == "today":
+        t = time.localtime()
+        return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+    return time.time() - WINDOWS.get(name, 86400)
+
+
+def report(conn, since: float):
+    rows = conn.execute(
+        "SELECT app, SUM(mwh), SUM(cpu_seconds) FROM usage WHERE ts >= ?"
+        " GROUP BY app ORDER BY SUM(mwh) DESC, SUM(cpu_seconds) DESC", (since,)).fetchall()
+    meta = conn.execute(
+        "SELECT SUM(seconds), SUM(CASE WHEN measured THEN seconds ELSE 0 END),"
+        " AVG(CASE WHEN measured THEN watts END) FROM samples WHERE ts >= ?",
+        (since,)).fetchone()
+    covered, measured, avg_watts = (meta or (0, 0, None))
+    return rows, {"covered": covered or 0, "measured": measured or 0, "avg_watts": avg_watts}
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_sample(args) -> int:
+    system = System()
+    conn = db()
+    if not args.daemon:
+        result = sample_once(system, conn)
+        print(json.dumps(result, indent=2) if args.json else format_now(result))
+        return 0
+    interval = int(settings().get("interval", 20))
+    while True:
+        try:
+            sample_once(system, conn)
+            maybe_auto_quiet(system)
+        except Exception as exc:
+            print(f"wattage: {exc}", file=sys.stderr)
+        time.sleep(interval)
+
+
+def maybe_auto_quiet(system: System) -> None:
+    s = settings()
+    cfg = s.get("quiet", {})
+    if not cfg.get("auto"):
+        return
+    power = system.power()
+    should = bool(power["discharging"]) and (power["percent"] or 100) <= int(
+        cfg.get("belowPercent", 100))
+    if should and not quiet_active():
+        set_quiet(True)
+    elif not should and quiet_active():
+        set_quiet(False)
+
+
+def format_now(result: dict) -> str:
+    if result.get("first"):
+        return "First sample taken; run again for attribution."
+    lines = []
+    if result.get("measured"):
+        lines.append(f"Drawing {human_watts(result['watts'])} on battery"
+                     f" ({result.get('percent')}%)")
+    else:
+        lines.append(f"On AC ({str(result.get('status', 'unknown')).lower()})"
+                     f" - draw is estimated from CPU, not measured")
+    for entry in result.get("top", []):
+        lines.append(f"  {entry['app']:<24} {human_energy(entry['mwh']):>10}"
+                     f"   {entry['cpu_seconds']:.1f}s cpu")
+    return "\n".join(lines)
+
+
+def cmd_now(args) -> int:
+    state = load_json(STATE_FILE, {}) or {}
+    if args.json:
+        print(json.dumps(state, indent=2))
+        return 0
+    if not state:
+        print("No samples yet - run: wattage sample")
+        return 1
+    if state.get("measured"):
+        print(f"Drawing {human_watts(state['watts'])} ({state.get('percent')}%)")
+    else:
+        print(f"On AC ({str(state.get('status', 'unknown')).lower()})"
+              f" - draw estimated from CPU")
+    for entry in state.get("top", [])[:5]:
+        print(f"  {entry['app']:<24} {human_energy(entry['mwh']):>10}")
+    return 0
+
+
+def cmd_top(args) -> int:
+    conn = db()
+    since = window_start(args.since)
+    rows, meta = report(conn, since)
+    if args.json:
+        print(json.dumps({
+            "since": args.since,
+            "covered_seconds": meta["covered"],
+            "measured_seconds": meta["measured"],
+            "average_watts": meta["avg_watts"],
+            "apps": [{"app": a, "mwh": round(m, 2), "cpu_seconds": round(c, 1)}
+                     for a, m, c in rows],
+        }, indent=2))
+        return 0
+    if not rows:
+        print(f"Nothing recorded in the last {args.since}. Is the sampler running?")
+        print("  wattage sample --daemon &   (or install the systemd timer: wattage service install)")
+        return 1
+
+    hours = meta["covered"] / 3600 if meta["covered"] else 0
+    total = sum(m for _a, m, _c in rows)
+
+    def duration(h):
+        if h >= 1:
+            return f"{h:.1f}h"
+        return f"{h * 60:.0f}m" if h * 60 >= 1 else f"{h * 3600:.0f}s"
+
+    print(f"\nWhere the power went - last {args.since}"
+          f"  ({duration(hours)} sampled, {duration(meta['measured'] / 3600)} on battery)")
+    if meta["avg_watts"]:
+        print(f"Average draw while on battery: {human_watts(meta['avg_watts'])}")
+    print()
+
+    # With no measured draw there is nothing to divide up, and a column of
+    # zeros reads as a broken tool. Rank by the thing that was measured.
+    by_energy = total > 0
+    if not by_energy:
+        rows = sorted(rows, key=lambda r: -r[2])
+        print("  No battery draw measured yet, so this is CPU time, not energy.")
+        print("  Unplug for a few minutes and Wattage learns what a CPU-second costs.")
+        print()
+
+    width = max((len(a) for a, _m, _c in rows[:args.limit]), default=10)
+    peak_cpu = max((c for _a, _m, c in rows[:args.limit]), default=0) or 1
+    for app, mwh, cpu_s in rows[:args.limit]:
+        if by_energy:
+            share = (mwh / total * 100) if total else 0
+            bar = "\u2588" * max(0, int(share / 3))
+            print(f"  {app:<{width}}  {human_energy(mwh):>9}  {share:5.1f}%  {bar} {cpu_s:.0f}s cpu")
+        else:
+            bar = "\u2588" * max(0, int(cpu_s / peak_cpu * 24))
+            print(f"  {app:<{width}}  {cpu_s:8.1f}s cpu  {bar}")
+    print()
+    if by_energy and meta["measured"] < meta["covered"]:
+        print("  Figures for time on AC are estimated from CPU use; only time on")
+        print("  battery is measured. Attribution is by CPU share of active draw.")
+        print()
+    return 0
+
+
+def cmd_bisect(args) -> int:
+    """Measure what one bar widget costs, by turning it off and looking.
+
+    Every Omarchy bar widget runs inside the one shell process, so no amount of
+    per-process accounting can separate them. Turning one off and measuring the
+    difference can.
+    """
+    pid = shell_pid()
+    if pid is None:
+        print("omarchy-shell is not running", file=sys.stderr)
+        return 1
+    seconds = args.seconds
+    print(f"Measuring {args.plugin} over {seconds * 2}s (the shell restarts twice)...")
+
+    with_on = measure_shell_cpu(seconds)
+    subprocess.run(["omarchy", "plugin", "disable", args.plugin],
+                   capture_output=True, text=True)
+    time.sleep(3)
+    with_off = measure_shell_cpu(seconds)
+    subprocess.run(["omarchy", "plugin", "enable", args.plugin],
+                   capture_output=True, text=True)
+
+    delta = with_on - with_off
+    s = settings()
+    per_cpu = float(s.get("wattsPerCpuSecond") or 0.0)
+    print(f"\n  shell CPU with {args.plugin} on:  {with_on:.2f}s per {seconds}s")
+    print(f"  shell CPU with it off:            {with_off:.2f}s per {seconds}s")
+    print(f"  attributable to the widget:       {delta:+.2f}s")
+    if per_cpu > 0:
+        watts = delta * per_cpu / seconds
+        print(f"  ≈ {human_watts(abs(watts))} {'extra' if watts >= 0 else 'saved'}")
+    else:
+        print("  (run on battery for a while first to learn watts per CPU-second)")
+    if abs(delta) < 0.05 * seconds / 10:
+        print("\n  That is within noise - this widget is not what is draining you.")
+    return 0
+
+
+def shell_pid() -> int | None:
+    try:
+        out = subprocess.run(["pgrep", "-x", "quickshell"], capture_output=True, text=True)
+        pids = [int(p) for p in out.stdout.split()]
+        return pids[0] if pids else None
+    except Exception:
+        return None
+
+
+def measure_shell_cpu(seconds: int) -> float:
+    system = System()
+    pid = shell_pid()
+    if pid is None:
+        return 0.0
+
+    def jiffies(p):
+        procs = system.processes()
+        return procs.get(p, ("", 0))[1]
+
+    start = jiffies(pid)
+    time.sleep(seconds)
+    pid = shell_pid() or pid
+    return max(0.0, (jiffies(pid) - start) / CLK_TCK)
+
+
+def cmd_quiet(args) -> int:
+    s = settings()
+    if args.mode == "status":
+        cfg = s.get("quiet", {})
+        print(f"quiet mode: {'on' if quiet_active() else 'off'}")
+        print(f"auto: {cfg.get('auto')} (below {cfg.get('belowPercent')}%)")
+        print(f"plugins: {', '.join(cfg.get('plugins', [])) or '(none configured)'}")
+        return 0
+    if args.mode == "add":
+        known = plugin_ids()
+        for pid in args.plugins:
+            if known and pid not in known:
+                print(f"unknown plugin id: {pid}", file=sys.stderr)
+                return 1
+            if pid not in s["quiet"]["plugins"]:
+                s["quiet"]["plugins"].append(pid)
+        save_settings(s)
+        print("quiet plugins: " + ", ".join(s["quiet"]["plugins"]))
+        return 0
+    if args.mode == "auto":
+        s["quiet"]["auto"] = not s["quiet"].get("auto")
+        save_settings(s)
+        print(f"auto quiet: {'on' if s['quiet']['auto'] else 'off'}")
+        return 0
+    on = args.mode == "on" if args.mode in ("on", "off") else not quiet_active()
+    touched = set_quiet(on)
+    print(f"quiet mode {'on' if on else 'off'}"
+          + (f" ({len(touched)} plugin(s) {'disabled' if on else 'restored'})" if touched else ""))
+    return 0
+
+
+def cmd_service(args) -> int:
+    unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "systemd/user"
+    cli = str(PLUGIN_DIR / "bin" / "wattage")
+    unit = unit_dir / "wattage.service"
+    if args.action == "install":
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        unit.write_text(f"""[Unit]
+Description=Wattage power attribution sampler
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={cli} sample --daemon
+Restart=on-failure
+RestartSec=10
+Nice=19
+
+[Install]
+WantedBy=default.target
+""")
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+        subprocess.run(["systemctl", "--user", "enable", "--now", "wattage.service"])
+        print(f"installed and started {unit}")
+        return 0
+    if args.action == "remove":
+        subprocess.run(["systemctl", "--user", "disable", "--now", "wattage.service"])
+        unit.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+        print("removed")
+        return 0
+    r = subprocess.run(["systemctl", "--user", "is-active", "wattage.service"],
+                       capture_output=True, text=True)
+    print(f"wattage.service: {r.stdout.strip() or 'not installed'}")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    ok = True
+
+    def check(label, good, detail=""):
+        nonlocal ok
+        if not good:
+            ok = False
+        print(f"[{'OK  ' if good else 'FAIL'}] {label}{(' - ' + detail) if detail else ''}")
+
+    system = System()
+    power = system.power()
+    check("Battery found", bool(power["battery"]), power["battery"] or "no battery in /sys")
+    check("Battery reports power", power["measured"] or not power["discharging"],
+          "power_now is 0 while discharging" if power["discharging"] else
+          f"on {power['status']} - draw is measurable once unplugged")
+    check("Per-process CPU readable", len(system.processes()) > 10)
+
+    rapl = Path("/sys/class/powercap/intel-rapl:0/energy_uj")
+    check("RAPL (optional)", True,
+          "readable" if os.access(rapl, os.R_OK) else "root-only, using battery draw instead")
+
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    check("Database", True, f"{DB_FILE} ({n} samples)")
+
+    s = settings()
+    check("Idle floor learned", float(s.get("idleWatts") or 0) > 0,
+          f"{s.get('idleWatts')} W" if s.get("idleWatts") else "run on battery for a few minutes")
+    check("Watts per CPU-second learned", float(s.get("wattsPerCpuSecond") or 0) > 0,
+          f"{s.get('wattsPerCpuSecond')}" if s.get("wattsPerCpuSecond") else "needs time on battery")
+
+    r = subprocess.run(["systemctl", "--user", "is-active", "wattage.service"],
+                       capture_output=True, text=True)
+    active = r.stdout.strip() == "active"
+    check("Sampler running", active, r.stdout.strip() or "run: wattage service install")
+
+    print()
+    print("Ready." if ok else "Some checks need attention - see above.")
+    return 0 if ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="wattage", description="Where your battery actually goes")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("sample", help="take a sample (or run the sampler)")
+    sp.add_argument("--daemon", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_sample)
+
+    nw = sub.add_parser("now", help="current draw and the top consumers")
+    nw.add_argument("--json", action="store_true")
+    nw.set_defaults(func=cmd_now)
+
+    tp = sub.add_parser("top", help="what used the most power over a window")
+    tp.add_argument("--since", default="24h", choices=list(WINDOWS))
+    tp.add_argument("--limit", type=int, default=12)
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(func=cmd_top)
+
+    bs = sub.add_parser("bisect", help="measure one bar widget by turning it off")
+    bs.add_argument("plugin")
+    bs.add_argument("--seconds", type=int, default=20)
+    bs.set_defaults(func=cmd_bisect)
+
+    q = sub.add_parser("quiet", help="suspend expensive widgets on battery")
+    q.add_argument("mode", choices=["on", "off", "toggle", "auto", "status", "add"])
+    q.add_argument("plugins", nargs="*")
+    q.set_defaults(func=cmd_quiet)
+
+    sv = sub.add_parser("service", help="the background sampler")
+    sv.add_argument("action", choices=["install", "remove", "status"])
+    sv.set_defaults(func=cmd_service)
+
+    sub.add_parser("doctor", help="check the install").set_defaults(func=cmd_doctor)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print(f"wattage: {exc}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

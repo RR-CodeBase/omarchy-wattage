@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rr-codebase.wattage",
+  "name": "Wattage",
+  "version": "0.1.0",
+  "author": "Ruan Roos",
+  "description": "Not how much battery is left — what ate it. Attributes real battery draw to the apps and widgets responsible, and quiets the expensive ones when you unplug.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "WattageWidget.qml"
+  },
+  "license": "MIT",
+  "barWidget": {
+    "displayName": "Wattage",
+    "description": "Live power draw with the apps responsible for it, a 14-day history, and a quiet mode that suspends expensive widgets on battery.",
+    "category": "Hardware",
+    "aliases": [
+      "power",
+      "battery",
+      "watts",
+      "drain",
+      "energy"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

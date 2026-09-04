@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Tests for Wattage's attribution model.
+
+Run: python3 tests/test_wattage.py
+
+The machine these tests run on is usually plugged in, and the interesting
+behaviour only happens on battery, so the system layer is faked: a scripted
+battery that discharges at a known rate and a scripted set of processes that
+burn a known number of jiffies. That makes the attribution arithmetic
+checkable against numbers worked out by hand, which is the only way to know
+the watts this thing reports mean anything.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import time
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+tmp = Path(tempfile.mkdtemp(prefix="wattage-test-"))
+os.environ["XDG_CONFIG_HOME"] = str(tmp / "config")
+os.environ["XDG_STATE_HOME"] = str(tmp / "state")
+os.environ["WATTAGE_DB"] = str(tmp / "wattage.db")
+
+_loader = importlib.machinery.SourceFileLoader("wattage", str(ROOT / "bin" / "wattage"))
+wattage = importlib.util.module_from_spec(importlib.util.spec_from_loader("wattage", _loader))
+_loader.exec_module(wattage)
+
+TICK = wattage.CLK_TCK
+PASSED, FAILED = 0, []
+
+
+def check(name, condition, detail=""):
+    global PASSED
+    if condition:
+        PASSED += 1
+    else:
+        FAILED.append(f"{name}{(': ' + detail) if detail else ''}")
+
+
+def close(a, b, tol=1e-6):
+    return abs(a - b) <= tol
+
+
+# ---- cgroup -> app name, against strings taken off a running machine -------
+
+CGROUPS = {
+    "app-ghostty-surface-transient-135447.scope": "ghostty",
+    "app-ghostty-surface-transient-837320.scope": "ghostty",
+    "app-Hyprland-brave-ec06e741.scope": "brave",
+    "app-Hyprland-hyprsunset-5a4cf7ec.scope": "hyprsunset",
+    "app-Hyprland-udiskie-7e48f5f6.scope": "udiskie",
+    "app-Hyprland-xdg\\x2dterminal\\x2dexec-94b95655.scope": "xdg-terminal-exec",
+    "app-Hyprland-omarchy\\x2dhyprland\\x2dmonitor\\x2dwatch-58277e9c.scope":
+        "omarchy-hyprland-monitor-watch",
+    "app-org.chromium.Chromium-2053133.scope": "Chromium",
+    "app-1password-1326.scope": "1password",
+    "app-1password@autostart.service": "1password",
+    "app-jetbrains\\x2dtoolbox@autostart.service": "jetbrains-toolbox",
+    "app-Hyprland-gtk\\x2dlaunch-438cd9d8.scope (deleted)": "gtk-launch",
+}
+for leaf, expected in CGROUPS.items():
+    got = wattage.app_from_cgroup(f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/{leaf}")
+    check(f"cgroup {leaf[:44]}", got == expected, f"got {got!r}, wanted {expected!r}")
+
+# Things that are not an app scope must fall through to the process name.
+for leaf in ["wayland-wm@hyprland.desktop.service",
+             "dbus-:1.22-org.a11y.atspi.Registry@0.service",
+             "session.slice", "", "init.scope"]:
+    check(f"non-app cgroup {leaf[:36]!r} -> None",
+          wattage.app_from_cgroup(f"0::/user.slice/{leaf}") is None,
+          str(wattage.app_from_cgroup(f"0::/user.slice/{leaf}")))
+
+# ---- the attribution arithmetic -------------------------------------------
+# 10 W of active draw over 3600s, split between two processes that burned 3
+# and 1 CPU-seconds: 7.5 W and 2.5 W, so 7500 and 2500 mWh.
+
+prev = {1: ("brave", 0), 2: ("ghostty", 0)}
+now = {1: ("brave", 3 * TICK), 2: ("ghostty", 1 * TICK)}
+rows, total_cpu = wattage.attribute(prev, now, active_watts=10.0, seconds=3600)
+by_app = {a: (c, m) for a, c, m in rows}
+check("attribution: total cpu", close(total_cpu, 4.0), str(total_cpu))
+check("attribution: 75% share -> 7500 mWh", close(by_app["brave"][1], 7500.0),
+      str(by_app["brave"][1]))
+check("attribution: 25% share -> 2500 mWh", close(by_app["ghostty"][1], 2500.0),
+      str(by_app["ghostty"][1]))
+check("attribution: energy sums to the draw",
+      close(sum(m for _a, _c, m in rows), 10000.0))
+
+# A process that did not exist at the previous sample cannot be charged for
+# CPU it may have burned before we saw it.
+rows, total_cpu = wattage.attribute({1: ("brave", 0)},
+                                    {1: ("brave", TICK), 99: ("new", 500 * TICK)},
+                                    active_watts=10.0, seconds=3600)
+check("attribution: unseen pid is skipped", [a for a, _c, _m in rows] == ["brave"],
+      str(rows))
+
+# Two processes of the same app are one line.
+rows, _ = wattage.attribute({1: ("brave", 0), 2: ("brave", 0)},
+                            {1: ("brave", TICK), 2: ("brave", TICK)},
+                            active_watts=8.0, seconds=3600)
+check("attribution: same app is summed", len(rows) == 1 and close(rows[0][1], 2.0),
+      str(rows))
+
+# Nothing ran: no division by zero, no energy invented.
+rows, total_cpu = wattage.attribute({1: ("idle", 5)}, {1: ("idle", 5)}, 10.0, 3600)
+check("attribution: idle interval attributes nothing", rows == [] and total_cpu == 0)
+
+# No measurement to divide up.
+rows, _ = wattage.attribute(prev, now, active_watts=0.0, seconds=3600)
+check("attribution: zero watts -> zero energy",
+      all(close(m, 0.0) for _a, _c, m in rows))
+
+
+# ---- a scripted machine ----------------------------------------------------
+
+class FakeSystem(wattage.System):
+    def __init__(self):
+        self.busy = 0
+        self.total = 0
+        self.procs = {}
+        self._power = {"battery": "BAT0", "status": "Discharging", "discharging": True,
+                       "watts": 10.0, "measured": True, "percent": 80,
+                       "energy_mwh": 30000, "full_mwh": 38000}
+
+    def cpu_total_jiffies(self):
+        return self.busy, self.total
+
+    def processes(self):
+        return dict(self.procs)
+
+    def power(self):
+        return dict(self._power)
+
+    def advance(self, seconds, cpu_seconds_by_app):
+        self.total += int(seconds * TICK * 16)
+        self.busy += int(sum(cpu_seconds_by_app.values()) * TICK)
+        for i, (app, secs) in enumerate(cpu_seconds_by_app.items(), start=1):
+            name, jiffies = self.procs.get(i, (app, 0))
+            self.procs[i] = (app, jiffies + int(secs * TICK))
+
+
+fake = FakeSystem()
+conn = wattage.db()
+
+BASE = time.time() - 600
+first = wattage.sample_once(fake, conn, now=BASE)
+check("first sample has nothing to compare against", first.get("first") is True, str(first))
+
+# Nearly idle while discharging: this reading teaches the idle floor.
+fake._power["watts"] = 4.0
+# Both processes must already exist, or the next interval rightly
+# refuses to charge them for CPU burned before we first saw them.
+fake.advance(60, {"brave": 0.2, "ghostty": 0.0})
+result = wattage.sample_once(fake, conn, now=BASE + 60)
+check("idle floor is learned", close(float(wattage.settings()["idleWatts"]), 4.0),
+      str(wattage.settings()["idleWatts"]))
+
+# Now something works hard: 12 W total, 4 W of which is the floor, so 8 W of
+# active draw over 60s = 133.33 mWh, split 3:1.
+fake._power["watts"] = 12.0
+fake.advance(60, {"brave": 30.0, "ghostty": 10.0})
+result = wattage.sample_once(fake, conn, now=BASE + 120)
+top = {e["app"]: e["mwh"] for e in result["top"]}
+check("busy sample is measured", result["measured"] is True, str(result))
+check("active draw excludes the idle floor", close(result["active_watts"], 8.0),
+      str(result["active_watts"]))
+check("heavy app gets three quarters", close(top.get("brave", 0), 100.0, 0.6), str(top))
+check("light app gets one quarter", close(top.get("ghostty", 0), 33.33, 0.6), str(top))
+check("watts per cpu-second is learned",
+      float(wattage.settings()["wattsPerCpuSecond"]) > 0,
+      str(wattage.settings()["wattsPerCpuSecond"]))
+
+# On AC there is no measurement, so the learned rate is used and the sample is
+# flagged as an estimate rather than silently presented as fact.
+fake._power.update({"status": "Full", "discharging": False, "watts": None, "measured": False})
+fake.advance(60, {"brave": 20.0})
+result = wattage.sample_once(fake, conn, now=BASE + 180)
+check("AC sample is not marked measured", result["measured"] is False, str(result))
+check("AC sample still attributes something", result["active_watts"] > 0,
+      str(result["active_watts"]))
+
+# A suspend, or a clock jump, must not book six hours of drain to whatever
+# happened to be running when the lid closed.
+fake.advance(60, {"brave": 5.0})
+result = wattage.sample_once(fake, conn, now=BASE + 180 + 7200)
+check("a long gap resets instead of attributing", result.get("reset") is True, str(result))
+
+# ---- storage and reporting -------------------------------------------------
+
+rows, meta = wattage.report(conn, since=0)
+apps = {a: m for a, m, _c in rows}
+check("report aggregates by app", "brave" in apps and "ghostty" in apps, str(apps))
+check("report ranks brave first", rows[0][0] == "brave", str(rows[:2]))
+check("report counts measured time", meta["measured"] > 0, str(meta))
+check("report counts covered time", meta["covered"] >= meta["measured"], str(meta))
+check("average watts is only over measured samples",
+      meta["avg_watts"] is not None and 3.0 <= meta["avg_watts"] <= 13.0,
+      str(meta["avg_watts"]))
+
+# ---- state file the widget reads -------------------------------------------
+
+state = json.loads(wattage.STATE_FILE.read_text())
+for key in ["watts", "measured", "discharging", "percent", "top", "quiet", "at"]:
+    check(f"state file has {key}", key in state, str(state)[:120])
+check("state top is a list of app/mwh",
+      isinstance(state["top"], list) and all("app" in e and "mwh" in e for e in state["top"]),
+      str(state["top"])[:120])
+
+# ---- settings --------------------------------------------------------------
+
+check("settings merge nested defaults", "auto" in wattage.settings()["quiet"])
+wattage.save_settings({**wattage.settings(), "quiet": {"auto": True}})
+merged = wattage.settings()
+check("a partial quiet block keeps its other keys",
+      merged["quiet"]["auto"] is True and "plugins" in merged["quiet"], str(merged["quiet"]))
+
+# ---- formatting ------------------------------------------------------------
+
+check("watts formatting", wattage.human_watts(0.42) == "420 mW", wattage.human_watts(0.42))
+check("watts formatting large", wattage.human_watts(12.34) == "12.3 W")
+check("energy formatting", wattage.human_energy(950) == "950 mWh")
+check("energy formatting large", wattage.human_energy(2500) == "2.50 Wh")
+
+shutil.rmtree(tmp, ignore_errors=True)
+print(f"\n{PASSED} passed, {len(FAILED)} failed")
+for f in FAILED:
+    print(f"  FAIL  {f}")
+sys.exit(1 if FAILED else 0)
