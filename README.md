@@ -151,16 +151,51 @@ for nothing.
 
 ## Install
 
-```bash
-git clone https://github.com/RR-CodeBase/omarchy-wattage
-cd omarchy-wattage
-./install.sh
+```sh
+omarchy plugin add https://github.com/RR-CodeBase/omarchy-wattage.git --enable
 ```
 
-This registers the plugin, places the bar widget, and installs a systemd user
-service that samples every 20 seconds at `Nice 19`. `./install.sh --uninstall`
-removes all of it. Your history is kept at
-`~/.local/state/omarchy/wattage.db` either way.
+Then start the sampler, which is what gives it anything to report:
+
+```sh
+~/.config/omarchy/plugins/io.github.rr-codebase.wattage/bin/wattage service install
+```
+
+Or from a clone, `git clone` then `./install.sh`, which registers the plugin,
+places the widget and installs the sampler in one go.
+
+## Usage
+
+The bar icon shows `󱐋` on battery, `󰚥` on AC and `󰤄` when quiet mode is on.
+Click it for the current draw and the top five using it; Escape closes the
+panel. Middle-click toggles quiet mode.
+
+```sh
+wattage now                  # current draw and top consumers
+wattage top --since 24h      # where the power went
+wattage plugins              # what each bar widget costs
+wattage doctor               # check the install
+```
+
+## Configure
+
+```sh
+omarchy bar move io.github.rr-codebase.wattage --section right
+```
+
+Settings live at `~/.config/omarchy/wattage/settings.json`; the table below
+covers them.
+
+## Remove
+
+```sh
+~/.config/omarchy/plugins/io.github.rr-codebase.wattage/install.sh --uninstall
+```
+
+That stops and removes the sampler service, restores anything quiet mode had
+turned off, and removes the plugin. `omarchy plugin remove
+io.github.rr-codebase.wattage` on its own leaves the service running. Your
+history stays at `~/.local/state/omarchy/wattage.db` either way.
 
 ## Using it
 
@@ -219,7 +254,8 @@ privileges at all.
 ## Tests
 
 ```bash
-python3 tests/test_wattage.py
+python3 tests/test_wattage.py     # attribution, quiet mode, per-widget cost
+python3 tests/test_plugin.py      # conformance with the Omarchy plugin guide
 ```
 
 83 assertions. The attribution arithmetic is checked against hand-computed
