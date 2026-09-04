@@ -280,6 +280,65 @@ check("undo survives the config being emptied", not touched_file.exists())
 
 wattage.save_settings(dict(wattage.DEFAULT_SETTINGS))
 
+# ---- per-widget cost -------------------------------------------------------
+# Bar widgets share one process, so the only way to tell them apart is to
+# switch one off and look. Slow, so the answer is written down.
+
+wattage.record_cost("acme.expensive", on_cpu=6.0, off_cpu=1.0, seconds=10)
+wattage.record_cost("acme.cheap", on_cpu=2.05, off_cpu=2.0, seconds=10)
+wattage.record_cost("acme.negative", on_cpu=1.9, off_cpu=2.0, seconds=10)
+
+rows = wattage.db().execute(
+    "SELECT id, cpu_delta FROM plugin_cost ORDER BY cpu_delta DESC").fetchall()
+costs = dict(rows)
+check("cost is stored per second of sample",
+      close(costs["acme.expensive"], 0.5), str(costs.get("acme.expensive")))
+check("a cheap widget lands near zero",
+      close(costs["acme.cheap"], 0.005), str(costs.get("acme.cheap")))
+check("ranked most expensive first", rows[0][0] == "acme.expensive", str(rows))
+check("re-measuring replaces rather than duplicates",
+      len(rows) == 3 and (wattage.record_cost("acme.cheap", 3.0, 1.0, 10) or
+                          wattage.db().execute("SELECT COUNT(*) FROM plugin_cost")
+                          .fetchone()[0] == 3))
+
+# Noise has to be called noise. A widget measuring -1.7% of a core is the
+# measurement moving, not a widget that gives power back.
+check("a tiny share reads as noise", "noise" in wattage.describe_cost(0.005),
+      wattage.describe_cost(0.005))
+check("a negative share reads as noise", "noise" in wattage.describe_cost(-0.017),
+      wattage.describe_cost(-0.017))
+check("a real share is reported in CPU-seconds an hour",
+      "an hour" in wattage.describe_cost(0.345), wattage.describe_cost(0.345))
+check("noise floor is 2% of a core", close(wattage.noise_floor(0), 0.02))
+
+# ---- helper processes ------------------------------------------------------
+# Not attribution: most children do not name the plugin that started them.
+# What it does catch is the ones that leak, which is worth knowing on its own.
+
+PS = """2466028    3442 voxtype status --follow --extended --format json
+2466065    3441 voxtype status --follow --extended --format json
+2508452    2655 voxtype status --follow --extended --format json
+2465501    3442 wl-paste --type text --watch /usr/share/omarchy/shell/plugins/clipboard/capture.sh text
+2465175    3443 /usr/bin/inotifywait -m -r -q -e close_write /home/ruan/.config/omarchy/plugins
+"""
+helpers = wattage.helper_processes(PS)
+by_command = {h["command"]: h for h in helpers}
+check("identical helpers are grouped", len(helpers) == 3, str([h["command"] for h in helpers]))
+check("duplicates are counted",
+      by_command["voxtype status --follow"]["count"] == 3,
+      str(by_command.get("voxtype status --follow")))
+check("the most duplicated comes first", helpers[0]["count"] == 3)
+check("age is the oldest of the group",
+      by_command["voxtype status --follow"]["oldest"] == 3442)
+check("a helper naming a plugin path is attributed",
+      by_command["wl-paste --type text"].get("plugin") == "clipboard",
+      str(by_command.get("wl-paste --type text")))
+check("a helper naming no plugin is left unattributed",
+      "plugin" not in by_command["/usr/bin/inotifywait -m -r"],
+      str(by_command.get("/usr/bin/inotifywait -m -r")))
+check("empty ps output is not a crash", wattage.helper_processes("") == [])
+check("a malformed ps line is skipped", wattage.helper_processes("garbage\n") == [])
+
 # ---- formatting ------------------------------------------------------------
 
 check("watts formatting", wattage.human_watts(0.42) == "420 mW", wattage.human_watts(0.42))

@@ -100,18 +100,54 @@ is what gets undone. So editing the list while quiet mode is on cannot strand
 anything, and if the machine dies with quiet mode still on, the sampler puts
 everything back the next time it starts on AC.
 
-### Measuring a single widget
+## Seeing what each plugin costs
 
-Every bar widget shares one Quickshell process, so no per-process accounting
-can separate them:
+Every bar widget runs inside the one Quickshell process. No amount of
+per-process accounting can separate them — so Wattage does the only thing that
+can, and switches one off to look:
 
 ```bash
-wattage bisect io.github.someone.expensive-widget
+wattage plugins             # the table, from what has been measured
+wattage plugins --measure   # measure every enabled widget (slow)
+wattage bisect <plugin-id>  # just one
 ```
 
-turns the widget off, measures the shell with and without it, and reports the
-difference — including "that is within noise", which is the answer more often
-than people expect.
+```
+What each bar widget costs the shell
+
+  io.github.rr-codebase.wallpaper-weather   +34.5% of a core  ██████████████████████
+  omarchy.clock                              -1.7% of a core  █  (noise)
+
+  Everything measurable adds up to 34% of a core.
+  Anything not listed has not been measured yet.
+```
+
+A sweep takes roughly half a minute per widget and makes the bar flicker
+throughout, so it asks first and is never run behind your back. Results are
+stored, so you measure once and read the table afterwards. Ctrl-C is safe:
+whatever is switched off gets switched back on, in a `finally`.
+
+A widget measuring below 2% of a core — or negative, which happens — is
+reported as noise rather than as a finding. Most widgets are noise. That is
+worth knowing too: it means quiet mode has nothing to offer for them.
+
+### What the shell is keeping alive
+
+```bash
+wattage helpers
+```
+
+lists the long-lived processes the shell has spawned, grouped and counted:
+
+```
+  voxtype status --follow  ×4
+  wl-paste --type text  [clipboard]
+```
+
+Most children do not name the plugin that started them, so this is not
+attribution — but a helper running four times over is a widget respawning it
+on every shell reload without stopping the old one, which costs CPU and memory
+for nothing.
 
 ## Install
 
@@ -137,7 +173,9 @@ removes all of it. Your history is kept at
 ```
 wattage now                  current draw and top consumers
 wattage top --since 24h      where the power went (1h 6h 24h today 7d 14d)
+wattage plugins [--measure]  what each bar widget costs
 wattage bisect <plugin-id>   measure one bar widget by turning it off
+wattage helpers              long-lived processes the shell spawned
 wattage quiet status|suggest|add <id>|remove <id>|on|off|toggle|auto
 wattage sample [--daemon]    take a sample, or run the sampler
 wattage service install|remove|status
@@ -184,7 +222,7 @@ privileges at all.
 python3 tests/test_wattage.py
 ```
 
-67 assertions. The attribution arithmetic is checked against hand-computed
+83 assertions. The attribution arithmetic is checked against hand-computed
 values through a scripted battery and scripted processes, because the
 interesting behaviour only happens on battery and a test machine is usually
 plugged in. Also covers the cgroup-to-app-name mapping against strings taken

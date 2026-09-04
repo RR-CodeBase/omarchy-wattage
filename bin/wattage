@@ -288,6 +288,14 @@ CREATE TABLE IF NOT EXISTS usage (
   PRIMARY KEY (ts, app)
 );
 CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts);
+CREATE TABLE IF NOT EXISTS plugin_cost (
+  id TEXT PRIMARY KEY,
+  cpu_delta REAL NOT NULL,     -- shell CPU-seconds attributable, per second
+  on_cpu REAL NOT NULL,
+  off_cpu REAL NOT NULL,
+  seconds REAL NOT NULL,
+  measured_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cursor (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   ts REAL, busy INTEGER, total INTEGER, pids TEXT
@@ -680,41 +688,211 @@ def cmd_top(args) -> int:
     return 0
 
 
-def cmd_bisect(args) -> int:
-    """Measure what one bar widget costs, by turning it off and looking.
+SETTLE = 5.0   # let the shell finish restarting before believing its CPU
 
-    Every Omarchy bar widget runs inside the one shell process, so no amount of
-    per-process accounting can separate them. Turning one off and measuring the
-    difference can.
+
+def measure_plugin(plugin: str, seconds: int, quiet: bool = False):
+    """Shell CPU with the widget on, and with it off. Restores it either way.
+
+    Every Omarchy bar widget runs inside the one shell process, so no amount
+    of per-process accounting can separate them. Turning one off and looking
+    can. It is slow and it makes the bar flicker, which is why the result is
+    written down rather than measured again every time you ask.
     """
-    pid = shell_pid()
-    if pid is None:
+    disabled = False
+    try:
+        time.sleep(SETTLE)
+        on_cpu = measure_shell_cpu(seconds)
+        r = subprocess.run(["omarchy", "plugin", "disable", plugin],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout or "disable failed").strip())
+        disabled = True
+        time.sleep(SETTLE)
+        off_cpu = measure_shell_cpu(seconds)
+    finally:
+        if disabled:
+            # Put it back even on Ctrl-C: leaving someone's bar missing a
+            # widget because they interrupted a measurement is unacceptable.
+            subprocess.run(["omarchy", "plugin", "enable", plugin],
+                           capture_output=True, text=True)
+            time.sleep(1)
+    return on_cpu, off_cpu
+
+
+def record_cost(plugin: str, on_cpu: float, off_cpu: float, seconds: int) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO plugin_cost"
+        " (id, cpu_delta, on_cpu, off_cpu, seconds, measured_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (plugin, (on_cpu - off_cpu) / max(seconds, 1e-9), on_cpu, off_cpu,
+         seconds, time.time()))
+    conn.commit()
+
+
+def noise_floor(seconds: int) -> float:
+    """Below this a difference is not worth reporting as a difference."""
+    return 0.02          # CPU-seconds per second, i.e. 2% of a core
+
+
+def cmd_bisect(args) -> int:
+    if shell_pid() is None:
         print("omarchy-shell is not running", file=sys.stderr)
         return 1
     seconds = args.seconds
-    print(f"Measuring {args.plugin} over {seconds * 2}s (the shell restarts twice)...")
+    print(f"Measuring {args.plugin} over about {seconds * 2 + SETTLE * 2:.0f}s"
+          f" (the bar will flicker twice)...")
+    try:
+        on_cpu, off_cpu = measure_plugin(args.plugin, seconds)
+    except RuntimeError as exc:
+        print(f"wattage: {exc}", file=sys.stderr)
+        return 1
+    record_cost(args.plugin, on_cpu, off_cpu, seconds)
 
-    with_on = measure_shell_cpu(seconds)
-    subprocess.run(["omarchy", "plugin", "disable", args.plugin],
-                   capture_output=True, text=True)
-    time.sleep(3)
-    with_off = measure_shell_cpu(seconds)
-    subprocess.run(["omarchy", "plugin", "enable", args.plugin],
-                   capture_output=True, text=True)
+    share = (on_cpu - off_cpu) / seconds
+    print(f"\n  shell CPU with {args.plugin} on:  {on_cpu:.2f}s per {seconds}s")
+    print(f"  shell CPU with it off:            {off_cpu:.2f}s per {seconds}s")
+    print(f"  attributable to the widget:       {share * 100:+.1f}% of a core")
+    print(f"  {describe_cost(share)}")
+    return 0
 
-    delta = with_on - with_off
-    s = settings()
-    per_cpu = float(s.get("wattsPerCpuSecond") or 0.0)
-    print(f"\n  shell CPU with {args.plugin} on:  {with_on:.2f}s per {seconds}s")
-    print(f"  shell CPU with it off:            {with_off:.2f}s per {seconds}s")
-    print(f"  attributable to the widget:       {delta:+.2f}s")
+
+def describe_cost(share: float) -> str:
+    """Say what a CPU share means in a unit anyone cares about."""
+    per_cpu = float(settings().get("wattsPerCpuSecond") or 0.0)
+    if abs(share) < noise_floor(0):
+        return "within noise - this widget is not what is draining you"
+    hourly = share * 3600
     if per_cpu > 0:
-        watts = delta * per_cpu / seconds
-        print(f"  ≈ {human_watts(abs(watts))} {'extra' if watts >= 0 else 'saved'}")
-    else:
-        print("  (run on battery for a while first to learn watts per CPU-second)")
-    if abs(delta) < 0.05 * seconds / 10:
-        print("\n  That is within noise - this widget is not what is draining you.")
+        return (f"about {human_watts(abs(share * per_cpu))}"
+                f" ({hourly:.0f} CPU-seconds an hour)")
+    return (f"{hourly:.0f} CPU-seconds an hour"
+            " (run on battery a while to turn that into watts)")
+
+
+def cmd_plugins(args) -> int:
+    """What each bar widget costs. Measured once, then just read back."""
+    conn = db()
+
+    if args.measure:
+        widgets = [w.get("id") for w in bar_widgets() if w.get("id")]
+        if args.only:
+            widgets = [w for w in widgets if w in args.only]
+        if not widgets:
+            print("No enabled bar widgets found.", file=sys.stderr)
+            return 1
+        each = args.seconds * 2 + SETTLE * 2 + 1
+        total = len(widgets) * each
+        print(f"\nMeasuring {len(widgets)} widgets, about {total / 60:.0f} minutes.")
+        print("Each one is switched off and back on, so the bar will flicker")
+        print("throughout. Ctrl-C is safe: whatever is off gets switched back on.\n")
+        if not args.yes and sys.stdin.isatty():
+            if input("Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
+                return 1
+        for i, plugin in enumerate(widgets, 1):
+            print(f"  [{i}/{len(widgets)}] {plugin} ... ", end="", flush=True)
+            try:
+                on_cpu, off_cpu = measure_plugin(plugin, args.seconds)
+            except (RuntimeError, KeyboardInterrupt) as exc:
+                print(f"skipped ({exc or 'interrupted'})")
+                if isinstance(exc, KeyboardInterrupt):
+                    return 130
+                continue
+            record_cost(plugin, on_cpu, off_cpu, args.seconds)
+            share = (on_cpu - off_cpu) / args.seconds
+            print(f"{share * 100:+.1f}% of a core")
+        print()
+
+    rows = conn.execute(
+        "SELECT id, cpu_delta, seconds, measured_at FROM plugin_cost"
+        " ORDER BY cpu_delta DESC").fetchall()
+    if args.json:
+        print(json.dumps([
+            {"id": r[0], "core_share": round(r[1], 4),
+             "cpu_seconds_per_hour": round(r[1] * 3600, 1),
+             "sample_seconds": r[2], "measured_at": r[3]} for r in rows], indent=2))
+        return 0
+    if not rows:
+        print("\nNo widget has been measured yet.\n")
+        print("  Every bar widget runs inside one Quickshell process, so the only")
+        print("  way to tell them apart is to switch one off and look. That is")
+        print("  slow and it makes the bar flicker, so it is not done behind your")
+        print("  back:\n")
+        print("      wattage plugins --measure        # all enabled widgets")
+        print("      wattage bisect <plugin-id>       # just one\n")
+        return 1
+
+    print("\nWhat each bar widget costs the shell\n")
+    width = max(len(r[0]) for r in rows)
+    peak = max((abs(r[1]) for r in rows), default=0) or 1
+    for pid, share, _sec, at in rows:
+        bar = "\u2588" * max(0, int(abs(share) / peak * 22))
+        note = "" if abs(share) >= noise_floor(0) else "  (noise)"
+        age = (time.time() - at) / 86400
+        stale = f"  {age:.0f}d ago" if age >= 1 else ""
+        print(f"  {pid:<{width}}  {share * 100:+6.1f}% of a core  {bar}{note}{stale}")
+    print()
+    per_cpu = float(settings().get("wattsPerCpuSecond") or 0.0)
+    total = sum(r[1] for r in rows if r[1] > 0)
+    print(f"  Everything measurable adds up to {total * 100:.0f}% of a core"
+          + (f", about {human_watts(total * per_cpu)}" if per_cpu > 0 else "") + ".")
+    print("  Anything not listed has not been measured yet.\n")
+    return 0
+
+
+def helper_processes(ps_output: str | None = None) -> list[dict]:
+    """Long-lived processes the shell spawned, which some widget is paying for.
+
+    Not attribution -- most children do not name the plugin that started them
+    -- but it does surface the ones that leak, which is worth knowing.
+    """
+    if ps_output is None:
+        pid = shell_pid()
+        if pid is None:
+            return []
+        try:
+            ps_output = subprocess.run(
+                ["ps", "--ppid", str(pid), "-o", "pid=,etimes=,args="],
+                capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            return []
+    out = ps_output
+    seen: dict[str, dict] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        _child, etimes, args = parts
+        key = " ".join(args.split()[:3])
+        entry = seen.setdefault(key, {"command": key, "count": 0, "oldest": 0})
+        entry["count"] += 1
+        entry["oldest"] = max(entry["oldest"], int(etimes))
+        m = re.search(r"/plugins/([a-z0-9._-]+)", args)
+        if m:
+            entry["plugin"] = m.group(1)
+    return sorted(seen.values(), key=lambda e: -e["count"])
+
+
+def cmd_helpers(args) -> int:
+    helpers = helper_processes()
+    if args.json:
+        print(json.dumps(helpers, indent=2))
+        return 0
+    if not helpers:
+        print("The shell has not spawned any long-lived helpers.")
+        return 0
+    print("\nProcesses the shell is keeping alive\n")
+    for h in helpers:
+        dupe = f"  \u00d7{h['count']}" if h["count"] > 1 else ""
+        owner = f"  [{h['plugin']}]" if h.get("plugin") else ""
+        print(f"  {h['command'][:66]}{dupe}{owner}")
+    leaks = [h for h in helpers if h["count"] > 1]
+    if leaks:
+        print()
+        print("  The duplicated ones are usually a widget that respawns its helper")
+        print("  on every shell reload without stopping the old one. They cost CPU")
+        print("  and memory for nothing.")
+    print()
     return 0
 
 
@@ -961,6 +1139,18 @@ def build_parser() -> argparse.ArgumentParser:
     bs.add_argument("plugin")
     bs.add_argument("--seconds", type=int, default=20)
     bs.set_defaults(func=cmd_bisect)
+
+    pl = sub.add_parser("plugins", help="what each bar widget costs")
+    pl.add_argument("--measure", action="store_true", help="measure them all (slow)")
+    pl.add_argument("--only", nargs="*", help="limit --measure to these ids")
+    pl.add_argument("--seconds", type=int, default=15)
+    pl.add_argument("--yes", "-y", action="store_true")
+    pl.add_argument("--json", action="store_true")
+    pl.set_defaults(func=cmd_plugins)
+
+    hp = sub.add_parser("helpers", help="processes the shell keeps alive")
+    hp.add_argument("--json", action="store_true")
+    hp.set_defaults(func=cmd_helpers)
 
     q = sub.add_parser("quiet", help="suspend expensive widgets on battery")
     q.add_argument("mode", choices=["on", "off", "toggle", "auto", "status",
