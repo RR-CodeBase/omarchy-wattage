@@ -46,28 +46,70 @@ Two honest limitations, stated up front:
   between two samples is never seen. A build that spawns thousands of compiler
   invocations will show up as the shell that spawned them, not as `cc1`.
 
-## What it does about it
+## Quiet mode: what it is for
 
-Finding the culprit is half of it. The other half:
+Finding the culprit is half of it. The other half is doing something about it.
+
+The premise is that a modern Omarchy bar runs a dozen QML widgets inside one
+long-lived shell process, some of them animating or polling continuously, and
+that on battery you would trade a few of them for runtime. Quiet mode turns off
+the ones you nominate when you unplug and puts them back when you plug in.
+
+Whether that is worth anything is a measurable question, so measure it. On the
+machine this was written on, the shell was using **37% of a core, continuously**.
+One plugin — an animated wallpaper drawing rain and fog — accounted for
+**45% of a core, 1613 CPU-seconds an hour**. With its effects off the shell
+dropped from 7.25 to 0.53 CPU-seconds per 15 seconds. That is what quiet mode
+is for. Equally: if `wattage bisect` tells you a widget costs nothing, quiet
+mode has nothing to offer you, and it says so rather than pretending.
+
+It is **opt-in and does nothing until you nominate something** — switching it on
+with an empty list used to write its marker, turn nothing off, and leave the bar
+icon lit forever. Now it refuses and tells you where to start:
 
 ```bash
-wattage quiet add io.github.someone.expensive-widget
-wattage quiet auto                    # switch on automatically on battery
+wattage quiet suggest              # the bar widgets you are running
+wattage bisect <plugin-id>         # what one of them actually costs
+wattage quiet add <plugin-id>      # nominate it
+wattage quiet auto                 # apply it automatically on battery
 ```
 
-Quiet mode disables the bar widgets you nominate and restores them when you
-plug back in. Which matters here more than on most desktops: the median
-Omarchy bar now runs a dozen QML widgets, each on its own poll timer, inside
-one long-lived shell process.
+### Turning down, not just turning off
 
-And because that one process is *shared*, no per-process accounting can tell
-you which widget inside it is the expensive one. So:
+A whole plugin is a blunt instrument. Usually the cost is one *setting* inside
+one plugin, and that plugin already has a switch for it. So a quiet target can
+be a pair of commands instead of a plugin id, in
+`~/.config/omarchy/wattage/settings.json`:
+
+```json
+"quiet": {
+  "auto": true,
+  "belowPercent": 80,
+  "plugins": [],
+  "commands": [
+    { "off":   "wallpaper-weather enabled off",
+      "on":    "wallpaper-weather enabled on",
+      "label": "wallpaper effects" }
+  ]
+}
+```
+
+Whatever was actually turned off is recorded in
+`~/.local/state/omarchy/wattage-quiet.json`, and that record — not the config —
+is what gets undone. So editing the list while quiet mode is on cannot strand
+anything, and if the machine dies with quiet mode still on, the sampler puts
+everything back the next time it starts on AC.
+
+### Measuring a single widget
+
+Every bar widget shares one Quickshell process, so no per-process accounting
+can separate them:
 
 ```bash
 wattage bisect io.github.someone.expensive-widget
 ```
 
-turns the widget off, measures the shell with and without it, and tells you the
+turns the widget off, measures the shell with and without it, and reports the
 difference — including "that is within noise", which is the answer more often
 than people expect.
 
@@ -90,13 +132,13 @@ removes all of it. Your history is kept at
 |---|---|
 | **Bar icon** | `󱐋` on battery, `󰚥` on AC, `󰤄` when quiet mode is on |
 | **Click** | current draw and the top five using it |
-| **Middle-click** | toggle quiet mode |
+| **Middle-click** | toggle quiet mode (once you have nominated something) |
 
 ```
 wattage now                  current draw and top consumers
 wattage top --since 24h      where the power went (1h 6h 24h today 7d 14d)
 wattage bisect <plugin-id>   measure one bar widget by turning it off
-wattage quiet on|off|auto|status|add <id...>
+wattage quiet status|suggest|add <id>|remove <id>|on|off|toggle|auto
 wattage sample [--daemon]    take a sample, or run the sampler
 wattage service install|remove|status
 wattage doctor               check the install
@@ -116,6 +158,7 @@ Add `--json` to `now` and `top` to get the numbers out.
 | `quiet.auto` | `false` | quieten automatically on battery |
 | `quiet.belowPercent` | `100` | ...at or below this charge |
 | `quiet.plugins` | `[]` | plugin ids quiet mode disables |
+| `quiet.commands` | `[]` | `{off, on, label}` triples to turn down instead |
 
 The two learned values are written back as Wattage observes your machine.
 Delete them to re-learn.
@@ -141,7 +184,7 @@ privileges at all.
 python3 tests/test_wattage.py
 ```
 
-54 assertions. The attribution arithmetic is checked against hand-computed
+67 assertions. The attribution arithmetic is checked against hand-computed
 values through a scripted battery and scripted processes, because the
 interesting behaviour only happens on battery and a test machine is usually
 plugged in. Also covers the cgroup-to-app-name mapping against strings taken

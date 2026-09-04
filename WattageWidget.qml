@@ -33,6 +33,7 @@ Panel {
   property int percent: -1
   property string batteryStatus: "unknown"
   property bool quiet: false
+  property bool quietConfigured: false
   property var consumers: []
   property real updatedAt: 0
 
@@ -76,6 +77,7 @@ Panel {
         root.percent = isFinite(p) ? p : -1
         root.batteryStatus = typeof s.status === "string" ? s.status : "unknown"
         root.quiet = s.quiet === true
+        root.quietConfigured = s.quietConfigured === true
         var at = Number(s.at)
         root.updatedAt = isFinite(at) ? at : 0
         var list = []
@@ -257,18 +259,27 @@ Panel {
           }
 
           Text {
-            text: "Quiet mode"
+            text: root.quietConfigured ? "Quiet mode" : "Quiet mode — nothing set up"
             textFormat: Text.PlainText
+            elide: Text.ElideRight
             color: root.panelText
+            opacity: root.quietConfigured ? 1.0 : 0.65
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.body
             anchors.left: quietIcon.right
             anchors.leftMargin: Style.space(10)
+            anchors.right: quietSwitch.left
+            anchors.rightMargin: Style.space(8)
             anchors.verticalCenter: parent.verticalCenter
           }
 
           ToggleSwitch {
+            id: quietSwitch
             checked: root.quiet
+            // Nothing nominated means nothing to turn off. A switch that
+            // flips and does nothing is worse than one that will not flip.
+            interactive: root.quietConfigured
+            opacity: root.quietConfigured ? 1.0 : 0.4
             foreground: root.panelText
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter

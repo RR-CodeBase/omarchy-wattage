@@ -221,6 +221,65 @@ merged = wattage.settings()
 check("a partial quiet block keeps its other keys",
       merged["quiet"]["auto"] is True and "plugins" in merged["quiet"], str(merged["quiet"]))
 
+# ---- quiet mode ------------------------------------------------------------
+# It used to accept being switched on with nothing nominated: it wrote the
+# marker, turned nothing off, and left the bar icon showing quiet mode forever.
+
+wattage.save_settings(dict(wattage.DEFAULT_SETTINGS))
+check("nothing configured by default", not wattage.quiet_configured())
+plugins, commands = wattage.quiet_targets()
+check("no targets by default", plugins == [] and commands == [])
+
+s2 = wattage.settings()
+s2["quiet"]["plugins"] = ["acme.heavy"]
+wattage.save_settings(s2)
+check("a nominated plugin counts as configured", wattage.quiet_configured())
+check("targets list the plugin", wattage.quiet_targets()[0] == ["acme.heavy"])
+
+s2 = wattage.settings()
+s2["quiet"] = {"plugins": [], "commands": [{"off": "true", "on": "true", "label": "x"}]}
+wattage.save_settings(s2)
+check("a command pair counts as configured", wattage.quiet_configured())
+check("targets list the command", len(wattage.quiet_targets()[1]) == 1)
+
+# A command entry with no way back up is not a target: quiet mode has to be
+# reversible or it is just breakage.
+s2 = wattage.settings()
+s2["quiet"] = {"plugins": [], "commands": [{"on": "true"}]}
+wattage.save_settings(s2)
+check("a command with no off is ignored", not wattage.quiet_configured(),
+      str(wattage.quiet_targets()))
+
+# Round-trip through real commands, so the marker records what to undo.
+marker = wattage.QUIET_MARKER
+touched_file = tmp / "quiet-was-here"
+s2 = wattage.settings()
+s2["quiet"] = {"plugins": [], "commands": [
+    {"off": f"touch {touched_file}", "on": f"rm -f {touched_file}", "label": "marker"}]}
+wattage.save_settings(s2)
+
+wattage.set_quiet(True)
+check("quiet on runs the off command", touched_file.exists())
+check("quiet on writes the marker", marker.exists())
+record = json.loads(marker.read_text())
+check("marker remembers the command to undo", len(record.get("commands", [])) == 1,
+      str(record))
+
+wattage.set_quiet(False)
+check("quiet off runs the on command", not touched_file.exists())
+check("quiet off clears the marker", not marker.exists())
+
+# Config changing while quiet mode is on must not strand anything: the undo
+# comes from the marker, not from whatever the settings say later.
+wattage.set_quiet(True)
+s2 = wattage.settings()
+s2["quiet"] = {"plugins": [], "commands": []}
+wattage.save_settings(s2)
+wattage.set_quiet(False)
+check("undo survives the config being emptied", not touched_file.exists())
+
+wattage.save_settings(dict(wattage.DEFAULT_SETTINGS))
+
 # ---- formatting ------------------------------------------------------------
 
 check("watts formatting", wattage.human_watts(0.42) == "420 mW", wattage.human_watts(0.42))

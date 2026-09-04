@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -43,11 +44,21 @@ DEFAULT_SETTINGS = {
     "idleWatts": 0.0,        # learned floor; 0 means "not learned yet"
     "wattsPerCpuSecond": 0.0,  # learned, used to estimate while on AC
     "quiet": {
-        "auto": False,       # quieten automatically on battery
+        "auto": False,        # quieten automatically on battery
         "belowPercent": 100,  # ...when the battery is at or below this
-        "plugins": [],       # plugin ids to disable
+        "plugins": [],        # bar plugin ids to disable
+        # Anything else that can be turned down and back up again. Whole
+        # plugins are a blunt instrument: the expensive thing is often one
+        # setting inside one of them, like an animated wallpaper's rain.
+        "commands": [],       # [{"off": "...", "on": "...", "label": "..."}]
     },
 }
+
+
+def ensure_config() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not SETTINGS_FILE.exists():
+        save_settings(dict(DEFAULT_SETTINGS))
 
 # Kernel threads have an empty /proc/<pid>/cmdline. They are the machine
 # breathing rather than anything a person started, and left in they crowd the
@@ -415,6 +426,7 @@ def write_state(result: dict, top) -> None:
         "status": result.get("status"),
         "top": [{"app": a, "mwh": round(m, 2)} for a, _c, m in top],
         "quiet": quiet_active(),
+        "quietConfigured": quiet_configured(),
         "at": time.time(),
     }, indent=2) + "\n")
 
@@ -428,6 +440,19 @@ def quiet_active() -> bool:
     return QUIET_MARKER.exists()
 
 
+def quiet_targets(s: dict | None = None) -> tuple[list, list]:
+    s = s or settings()
+    cfg = s.get("quiet", {}) or {}
+    plugins = [p for p in (cfg.get("plugins") or []) if p]
+    commands = [c for c in (cfg.get("commands") or []) if isinstance(c, dict) and c.get("off")]
+    return plugins, commands
+
+
+def quiet_configured() -> bool:
+    plugins, commands = quiet_targets()
+    return bool(plugins or commands)
+
+
 def plugin_ids() -> list[str]:
     try:
         out = subprocess.run(["omarchy", "plugin", "list", "--json"],
@@ -438,18 +463,36 @@ def plugin_ids() -> list[str]:
 
 
 def set_quiet(on: bool) -> list[str]:
-    s = settings()
-    targets = [p for p in s["quiet"].get("plugins", []) if p]
+    """Turn the nominated things down, and remember exactly what was turned
+    down so the same things come back up -- even if the config changes in
+    between, or the machine dies with quiet mode still on."""
+    plugins, commands = quiet_targets()
     touched = []
     if on:
         if quiet_active():
             return []
-        for pid in targets:
+        for pid in plugins:
             r = subprocess.run(["omarchy", "plugin", "disable", pid],
                                capture_output=True, text=True)
             if r.returncode == 0:
                 touched.append(pid)
-        atomic_write(QUIET_MARKER, json.dumps({"disabled": touched, "at": time.time()}))
+        ran = []
+        for entry in commands:
+            try:
+                r = subprocess.run(shlex.split(entry["off"]), capture_output=True,
+                                   text=True, timeout=20)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                print(f"wattage: quiet off {entry['off']!r}: {exc}", file=sys.stderr)
+                continue
+            if r.returncode == 0:
+                ran.append(entry)
+                touched.append(entry.get("label") or entry["off"])
+            else:
+                print(f"wattage: quiet off {entry['off']!r} exited {r.returncode}:"
+                      f" {(r.stderr or '').strip()[:120]}", file=sys.stderr)
+        atomic_write(QUIET_MARKER, json.dumps(
+            {"disabled": [p for p in touched if p in plugins],
+             "commands": ran, "at": time.time()}, indent=2))
     else:
         record = load_json(QUIET_MARKER, {}) or {}
         for pid in record.get("disabled", []):
@@ -457,6 +500,20 @@ def set_quiet(on: bool) -> list[str]:
                                capture_output=True, text=True)
             if r.returncode == 0:
                 touched.append(pid)
+        for entry in record.get("commands", []):
+            if not entry.get("on"):
+                continue
+            try:
+                r = subprocess.run(shlex.split(entry["on"]), capture_output=True,
+                                   text=True, timeout=20)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                print(f"wattage: quiet on {entry['on']!r}: {exc}", file=sys.stderr)
+                continue
+            if r.returncode == 0:
+                touched.append(entry.get("label") or entry["on"])
+            else:
+                print(f"wattage: quiet on {entry['on']!r} exited {r.returncode}:"
+                      f" {(r.stderr or '').strip()[:120]}", file=sys.stderr)
         try:
             QUIET_MARKER.unlink()
         except OSError:
@@ -491,12 +548,20 @@ def report(conn, since: float):
 # ---------------------------------------------------------------- commands
 
 def cmd_sample(args) -> int:
+    ensure_config()
     system = System()
     conn = db()
     if not args.daemon:
         result = sample_once(system, conn)
         print(json.dumps(result, indent=2) if args.json else format_now(result))
         return 0
+    # If quiet mode was left on and we are no longer on battery -- a crash, a
+    # reboot, a kill -9 -- put everything back before doing anything else.
+    if quiet_active() and not system.power()["discharging"]:
+        restored = set_quiet(False)
+        if restored:
+            print(f"wattage: restored {len(restored)} item(s) left quietened",
+                  file=sys.stderr)
     interval = int(settings().get("interval", 20))
     while True:
         try:
@@ -678,34 +743,112 @@ def measure_shell_cpu(seconds: int) -> float:
     return max(0.0, (jiffies(pid) - start) / CLK_TCK)
 
 
+def bar_widgets() -> list[dict]:
+    """Enabled bar widgets, as candidates for quiet mode."""
+    try:
+        out = subprocess.run(["omarchy", "plugin", "list", "--json"],
+                             capture_output=True, text=True, timeout=15).stdout
+        plugins = json.loads(out or "[]")
+    except Exception:
+        return []
+    return [p for p in plugins
+            if "bar-widget" in (p.get("kinds") or []) and p.get("enabled") is not False]
+
+
 def cmd_quiet(args) -> int:
+    ensure_config()
     s = settings()
+    plugins, commands = quiet_targets(s)
+
     if args.mode == "status":
         cfg = s.get("quiet", {})
-        print(f"quiet mode: {'on' if quiet_active() else 'off'}")
-        print(f"auto: {cfg.get('auto')} (below {cfg.get('belowPercent')}%)")
-        print(f"plugins: {', '.join(cfg.get('plugins', [])) or '(none configured)'}")
+        active = quiet_active()
+        print(f"quiet mode: {'on' if active else 'off'}")
+        if active:
+            record = load_json(QUIET_MARKER, {}) or {}
+            for pid in record.get("disabled", []):
+                print(f"  disabled: {pid}")
+            for entry in record.get("commands", []):
+                print(f"  turned down: {entry.get('label') or entry.get('off')}")
+        print(f"auto: {'on' if cfg.get('auto') else 'off'}"
+              f" (at or below {cfg.get('belowPercent')}% on battery)")
+        if plugins or commands:
+            for pid in plugins:
+                print(f"  will disable: {pid}")
+            for entry in commands:
+                print(f"  will turn down: {entry.get('label') or entry.get('off')}")
+        else:
+            print("  nothing configured - quiet mode has nothing to turn off")
+            print("  see candidates with:  wattage quiet suggest")
         return 0
+
+    if args.mode == "suggest":
+        widgets = bar_widgets()
+        if not widgets:
+            print("Could not read the plugin list.")
+            return 1
+        print("\nBar widgets you could quieten on battery:\n")
+        for w in widgets:
+            print(f"  {w.get('id')}")
+            if w.get("description"):
+                print(f"      {w['description'][:76]}")
+        print("\n  Add one with:   wattage quiet add <id>")
+        print("  Measure one first:  wattage bisect <id>")
+        print("\n  Whole plugins are blunt. If the cost is one setting inside a")
+        print("  plugin, put its own on/off commands under quiet.commands in")
+        print(f"  {SETTINGS_FILE}\n")
+        return 0
+
     if args.mode == "add":
         known = plugin_ids()
         for pid in args.plugins:
             if known and pid not in known:
                 print(f"unknown plugin id: {pid}", file=sys.stderr)
+                print("see:  wattage quiet suggest", file=sys.stderr)
                 return 1
             if pid not in s["quiet"]["plugins"]:
                 s["quiet"]["plugins"].append(pid)
         save_settings(s)
         print("quiet plugins: " + ", ".join(s["quiet"]["plugins"]))
         return 0
+
+    if args.mode == "remove":
+        s["quiet"]["plugins"] = [p for p in s["quiet"]["plugins"] if p not in args.plugins]
+        save_settings(s)
+        print("quiet plugins: " + (", ".join(s["quiet"]["plugins"]) or "(none)"))
+        return 0
+
     if args.mode == "auto":
+        if not quiet_configured():
+            print("Nothing is configured to quieten, so auto would do nothing.",
+                  file=sys.stderr)
+            print("Start with:  wattage quiet suggest", file=sys.stderr)
+            return 1
         s["quiet"]["auto"] = not s["quiet"].get("auto")
         save_settings(s)
         print(f"auto quiet: {'on' if s['quiet']['auto'] else 'off'}")
         return 0
+
     on = args.mode == "on" if args.mode in ("on", "off") else not quiet_active()
+
+    # Turning it "on" with nothing to turn off used to write the marker,
+    # change nothing, and leave the bar icon showing quiet mode forever.
+    if on and not quiet_configured():
+        print("Quiet mode has nothing to turn off yet.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  It disables the bar widgets you nominate while you are on", file=sys.stderr)
+        print("  battery, and puts them back when you plug in. Nominate one:", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("      wattage quiet suggest        # what you are running", file=sys.stderr)
+        print("      wattage bisect <plugin-id>   # what it actually costs", file=sys.stderr)
+        print("      wattage quiet add <plugin-id>", file=sys.stderr)
+        print("", file=sys.stderr)
+        return 1
+
     touched = set_quiet(on)
     print(f"quiet mode {'on' if on else 'off'}"
-          + (f" ({len(touched)} plugin(s) {'disabled' if on else 'restored'})" if touched else ""))
+          + (f" ({len(touched)} restored)" if touched and not on
+             else f" ({len(touched)} turned down)" if touched else ""))
     return 0
 
 
@@ -820,7 +963,8 @@ def build_parser() -> argparse.ArgumentParser:
     bs.set_defaults(func=cmd_bisect)
 
     q = sub.add_parser("quiet", help="suspend expensive widgets on battery")
-    q.add_argument("mode", choices=["on", "off", "toggle", "auto", "status", "add"])
+    q.add_argument("mode", choices=["on", "off", "toggle", "auto", "status",
+                                    "add", "remove", "suggest"])
     q.add_argument("plugins", nargs="*")
     q.set_defaults(func=cmd_quiet)
 
