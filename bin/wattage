@@ -6,7 +6,7 @@ answers the question people actually ask at 3pm: what is draining this thing?
 
 There is no per-process power meter in any laptop. What there is: the battery's
 own reported draw, which is ground truth for the whole machine, and per-process
-CPU time. Wattage samples both and divides the machine's *active* draw between
+CPU time. Battery Watt Usage samples both and divides the machine's *active* draw between
 processes in proportion to the CPU they burned, leaving the idle floor
 unattributed. That is an estimate, and the UI says so -- but it is an estimate
 built on a real measurement, and it is enough to find the process costing you
@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -162,7 +163,7 @@ def app_from_cgroup(cgroup: str) -> str | None:
 # ---------------------------------------------------------------- the system
 
 class System:
-    """Everything Wattage reads from the machine, in one place so tests can
+    """Everything read from the machine, in one place so tests can
     substitute a fake one."""
 
     def __init__(self, proc="/proc", power_supply="/sys/class/power_supply"):
@@ -667,7 +668,7 @@ def cmd_top(args) -> int:
     if not by_energy:
         rows = sorted(rows, key=lambda r: -r[2])
         print("  No battery draw measured yet, so this is CPU time, not energy.")
-        print("  Unplug for a few minutes and Wattage learns what a CPU-second costs.")
+        print("  Unplug for a few minutes and Battery Watt Usage learns what a CPU-second costs.")
         print()
 
     width = max((len(a) for a, _m, _c in rows[:args.limit]), default=10)
@@ -1030,14 +1031,59 @@ def cmd_quiet(args) -> int:
     return 0
 
 
+UNIT_MARK = "# managed by io.github.rr-codebase.wattage"
+
+
+def unit_is_ours(unit: Path) -> bool | None:
+    """True if we wrote this unit, False if somebody else did, None if absent.
+
+    `wattage.service` is a name, not a claim: the file at that path may be one
+    the user wrote themselves, or a symlink they pointed at a unit of their
+    own. Writing or deleting it without checking would destroy that, so it is
+    opened no-follow and has to identify itself before we touch it.
+    """
+    try:
+        st = os.lstat(unit)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False  # a symlink, or something stranger - not ours either way
+    try:
+        fd = os.open(unit, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "r", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    if UNIT_MARK in text:
+        return True
+    # 0.1.0 wrote no marker. A unit whose ExecStart runs a wattage CLI is still
+    # unmistakably ours, and refusing to upgrade it would strand everyone who
+    # installed before the marker existed.
+    return any(
+        line.startswith("ExecStart=") and line.rstrip().endswith("/bin/wattage sample --daemon")
+        for line in text.splitlines()
+    )
+
+
 def cmd_service(args) -> int:
     unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "systemd/user"
     cli = str(PLUGIN_DIR / "bin" / "wattage")
     unit = unit_dir / "wattage.service"
     if args.action == "install":
+        if unit_is_ours(unit) is False:
+            print(f"{unit} exists and was not written by Battery Watt Usage - leaving it alone.\n"
+                  f"Move it aside and re-run if you want the sampler here.",
+                  file=sys.stderr)
+            return 1
         unit_dir.mkdir(parents=True, exist_ok=True)
-        unit.write_text(f"""[Unit]
-Description=Wattage power attribution sampler
+        text = f"""{UNIT_MARK}
+[Unit]
+Description=Battery Watt Usage power attribution sampler
 After=graphical-session.target
 
 [Service]
@@ -1049,14 +1095,28 @@ Nice=19
 
 [Install]
 WantedBy=default.target
-""")
+"""
+        # Staged and renamed rather than written in place: an existing unit is
+        # replaced, never written through, and a symlink at the destination is
+        # swapped out instead of followed to whatever it aims at.
+        tmp = unit_dir / "wattage.service.new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, unit)
         subprocess.run(["systemctl", "--user", "daemon-reload"])
         subprocess.run(["systemctl", "--user", "enable", "--now", "wattage.service"])
         print(f"installed and started {unit}")
         return 0
     if args.action == "remove":
+        owned = unit_is_ours(unit)
+        if owned is False:
+            print(f"{unit} was not written by Battery Watt Usage - leaving it, and the "
+                  f"service it controls, alone.", file=sys.stderr)
+            return 1
         subprocess.run(["systemctl", "--user", "disable", "--now", "wattage.service"])
-        unit.unlink(missing_ok=True)
+        if owned:
+            unit.unlink(missing_ok=True)
         subprocess.run(["systemctl", "--user", "daemon-reload"])
         print("removed")
         return 0

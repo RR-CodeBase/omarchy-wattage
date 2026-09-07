@@ -1,9 +1,9 @@
-# Wattage
+# Battery Watt Usage
 
 **Not how much battery is left. What ate it.**
 
 Every battery widget shows you the same number the kernel already knows.
-Wattage answers the question people actually ask at 3pm: *what is draining
+Battery Watt Usage answers the question people actually ask at 3pm: *what is draining
 this thing?*
 
 ```
@@ -23,7 +23,7 @@ It can't, exactly — and it says so rather than pretending.
 
 No laptop has a per-process power meter. What it does have is the battery's
 own reported draw, which is ground truth for the whole machine, and per-process
-CPU time. Wattage samples both every 20 seconds and splits the machine's
+CPU time. Battery Watt Usage samples both every 20 seconds and splits the machine's
 **active** draw between processes in proportion to the CPU they burned:
 
 ```
@@ -39,7 +39,7 @@ and it is more than enough to find the process costing you an hour of runtime.
 Two honest limitations, stated up front:
 
 - **On AC there is nothing to measure.** Most firmware reports zero draw while
-  plugged in. Wattage learns what a CPU-second costs while you are on battery
+  plugged in. Battery Watt Usage learns what a CPU-second costs while you are on battery
   and uses that to estimate on AC, marking those figures as estimates. Before
   it has learned, it ranks by CPU time and says that is what it is doing.
 - **Very short-lived processes are missed.** A process that starts and exits
@@ -103,7 +103,7 @@ everything back the next time it starts on AC.
 ## Seeing what each plugin costs
 
 Every bar widget runs inside the one Quickshell process. No amount of
-per-process accounting can separate them — so Wattage does the only thing that
+per-process accounting can separate them — so Battery Watt Usage does the only thing that
 can, and switches one off to look:
 
 ```bash
@@ -156,7 +156,7 @@ omarchy plugin add https://github.com/RR-CodeBase/omarchy-wattage.git --enable
 ```
 
 Then run `install.sh`, which starts the background sampler — the thing that
-gives Wattage anything to report — and links `wattage` into `~/.local/bin` with
+gives Battery Watt Usage anything to report — and links `wattage` into `~/.local/bin` with
 bash completion, so the commands below work as written:
 
 ```sh
@@ -238,7 +238,7 @@ Add `--json` to `now` and `top` to get the numbers out.
 | `quiet.plugins` | `[]` | plugin ids quiet mode disables |
 | `quiet.commands` | `[]` | `{off, on, label}` triples to turn down instead |
 
-The two learned values are written back as Wattage observes your machine.
+The two learned values are written back as Battery Watt Usage observes your machine.
 Delete them to re-learn.
 
 ## Cost of running it
@@ -253,7 +253,7 @@ at `Nice 19`. It writes about 4 MB a month to SQLite and prunes to 14 days.
 - Python 3.11+ (standard library only)
 
 RAPL would give a finer-grained reading, but `energy_uj` is root-only on Arch
-(a side-channel mitigation), so Wattage uses the battery instead and needs no
+(a side-channel mitigation), so Battery Watt Usage uses the battery instead and needs no
 privileges at all.
 
 ## Tests

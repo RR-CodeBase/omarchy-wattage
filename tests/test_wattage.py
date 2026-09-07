@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for Wattage's attribution model.
+"""Tests for Battery Watt Usage's attribution model.
 
 Run: python3 tests/test_wattage.py
 
