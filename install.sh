@@ -43,6 +43,31 @@ file_is_ours() {
   [[ -f $1 && ! -L $1 ]] && grep -qF -- "$MANAGED_MARK" "$1" 2>/dev/null
 }
 
+# Copy a file into place without trusting any path twice. Creating the
+# temporary file safely is not enough on its own: chmod and mv each resolve its
+# name again, and between two resolutions another process running as this user
+# can unlink it and leave something else in its place. So the file is held open
+# on a descriptor, written and chmodded through /proc/self/fd, and its identity
+# is checked against the name one last time before the rename - with `stat` not
+# dereferencing, so a symlink swapped in reports its own inode and fails the
+# comparison rather than passing through to the same target.
+install_through_fd() {
+  local src=$1 dest=$2 tmp ident
+  tmp=$(mktemp "${dest%/*}/.${dest##*/}.XXXXXXXX" 2>/dev/null) || return 1
+  exec 9>"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  if cat -- "$src" >&9 \
+     && chmod 0644 /proc/self/fd/9 \
+     && ident=$(stat -Lc '%d:%i' /proc/self/fd/9 2>/dev/null) \
+     && [[ -n $ident && $(stat -c '%d:%i' "$tmp" 2>/dev/null) == "$ident" ]] \
+     && mv -f "$tmp" "$dest"; then
+    exec 9>&-
+    return 0
+  fi
+  exec 9>&-
+  rm -f "$tmp"
+  return 1
+}
+
 usage() {
   cat <<USAGE
 Usage: ./install.sh [options]
@@ -150,19 +175,9 @@ if [[ -f $SCRIPT_DIR/completions/wattage ]]; then
     warn "$(tilde "$COMPLETION") already exists and is not ours - left alone"
   else
     mkdir -p "$(dirname "$COMPLETION")"
-    # Written to a fresh temporary file and renamed into place, so whatever is
-    # at the destination is replaced rather than written through. The temporary
-    # name is random and created exclusively: a predictable `$COMPLETION.new`
-    # could be pre-created by anyone who can write to that directory - as a
-    # symlink, to redirect the write, or as a FIFO, to block it. mktemp makes a
-    # new regular file at 0600 or fails outright.
-    if tmp=$(mktemp "${COMPLETION%/*}/.wattage-completion.XXXXXXXX" 2>/dev/null) \
-       && cat "$SCRIPT_DIR/completions/wattage" > "$tmp" \
-       && chmod 0644 "$tmp" \
-       && mv -f "$tmp" "$COMPLETION"; then
+    if install_through_fd "$SCRIPT_DIR/completions/wattage" "$COMPLETION"; then
       ok "shell completion installed"
     else
-      [[ -n ${tmp:-} ]] && rm -f "$tmp"
       warn "could not install the shell completion"
     fi
   fi

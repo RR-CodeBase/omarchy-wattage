@@ -1057,6 +1057,50 @@ WantedBy=default.target
 """
 
 
+def write_through_fd(directory: Path, name: str, text: str, mode: int) -> None:
+    """Write `name` into `directory` without trusting a path twice.
+
+    Creating the temporary file safely is not enough on its own: once it exists,
+    every step that names it again - chmod, rename - re-resolves that name, and
+    between two resolutions another process running as this user can unlink it
+    and put something else there. So the directory is opened once and every
+    later step is relative to that descriptor, and the mode is set with fchmod
+    on the open file rather than on its name.
+
+    rename() is the one step POSIX offers only by name. Immediately before it
+    the name is resolved once more - relative to the same directory, without
+    following symlinks - and compared against the identity we created. If the
+    entry is no longer our file we raise instead of moving a stranger's file
+    into place.
+    """
+    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd, tmppath = tempfile.mkstemp(dir=directory, prefix="." + name + ".", suffix=".tmp")
+        tmpname = os.path.basename(tmppath)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                st = os.fstat(fh.fileno())
+                if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                    raise RuntimeError(f"{tmppath} is not the file we created")
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+                os.fchmod(fh.fileno(), mode)
+                created = (st.st_dev, st.st_ino)
+            now = os.stat(tmpname, dir_fd=dfd, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != created:
+                raise RuntimeError(f"{tmppath} was replaced before it could be installed")
+            os.replace(tmpname, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmpname, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+
+
 def unit_is_ours(unit: Path, cli: str) -> bool | None:
     """True if we wrote this unit, False if somebody else did, None if absent.
 
@@ -1106,32 +1150,7 @@ def cmd_service(args) -> int:
             return 1
         unit_dir.mkdir(parents=True, exist_ok=True)
         text = UNIT_MARK + "\n" + unit_body(cli, UNIT_DESCRIPTION)
-        # Written to a fresh temporary file and renamed into place, so an
-        # existing unit is replaced rather than written through and a symlink
-        # there is swapped out instead of followed. The temporary name is
-        # random and created O_EXCL: a predictable `wattage.service.new` could
-        # be pre-created by anyone who can write to this directory, as a
-        # symlink to redirect the write or a FIFO to block it. mkstemp() makes
-        # a new regular file at 0600 or fails, and the descriptor is checked
-        # before anything is written through it.
-        fd, tmpname = tempfile.mkstemp(
-            dir=unit_dir, prefix=".wattage.service.", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                st = os.fstat(fh.fileno())
-                if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-                    raise RuntimeError(f"{tmpname} is not the file we created")
-                fh.write(text)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.chmod(tmpname, 0o644)
-            os.replace(tmpname, unit)
-        except BaseException:
-            try:
-                os.unlink(tmpname)
-            except OSError:
-                pass
-            raise
+        write_through_fd(unit_dir, unit.name, text, 0o644)
         subprocess.run(["systemctl", "--user", "daemon-reload"])
         subprocess.run(["systemctl", "--user", "enable", "--now", "wattage.service"])
         print(f"installed and started {unit}")

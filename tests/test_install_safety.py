@@ -12,8 +12,10 @@ aimed somewhere else, a directory - then check the real helpers, lifted out of
 install.sh itself, refuse each one.
 """
 
+import os
 import re
 import shlex
+import stat
 import shutil
 import subprocess
 import sys
@@ -44,11 +46,11 @@ def check(name, condition, detail=""):
 
 SH = (ROOT / "install.sh").read_text()
 _start = SH.index('CLI_NAME="')
-_body = SH.index("file_is_ours() {", _start)
+_body = SH.index("install_through_fd() {", _start)
 _end = SH.index("\n}\n", _body) + 3
 HELPERS = SH[_start:_end]
-check("the ownership helpers were found in install.sh",
-      "link_is_ours" in HELPERS and "file_is_ours" in HELPERS)
+check("the installer helpers were found in install.sh",
+      all(f in HELPERS for f in ("link_is_ours", "file_is_ours", "install_through_fd")))
 
 SB = Path(tempfile.mkdtemp(prefix="wattage-install-safety-"))
 PLUGIN = SB / ".config/omarchy/plugins" / PLUGIN_ID / "bin"
@@ -71,6 +73,20 @@ def probe(predicate, path):
     return subprocess.run(["bash", "-c", script],
                           stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL).returncode == 0
+
+
+def run(body):
+    """Run a snippet with the shipped helpers loaded; returns (rc, stdout)."""
+    script = "\n".join([
+        "set -uo pipefail",
+        "HOME=" + shlex.quote(str(SB)),
+        "PLUGIN_ID=" + shlex.quote(PLUGIN_ID),
+        "CLI=" + shlex.quote(str(CLI)),
+        HELPERS,
+        body,
+    ])
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
 
 
 # ---- link_is_ours: only a symlink naming our own CLI counts -----------------
@@ -130,16 +146,49 @@ check("a symlink to a marked file is not treated as ours",
       not probe("file_is_ours", symmarked),
       "removing it would delete a link the user made deliberately")
 
+# ---- install_through_fd: the destination is replaced, never written through -
+
+fddir = SB / "fd"
+fddir.mkdir()
+source = fddir / "source"
+source.write_text("# shipped completion\n")
+
+dest = fddir / "plain"
+rc, _ = run(f"install_through_fd {shlex.quote(str(source))} {shlex.quote(str(dest))}")
+check("install_through_fd installs the file", rc == 0 and dest.read_text() == source.read_text())
+check("install_through_fd leaves it 0644",
+      stat.S_IMODE(os.lstat(dest).st_mode) == 0o644,
+      oct(stat.S_IMODE(os.lstat(dest).st_mode)))
+
+fdvictim = SB / "fd-victim"
+fdvictim.write_text("precious")
+symdest = fddir / "symdest"
+symdest.symlink_to(fdvictim)
+rc, _ = run(f"install_through_fd {shlex.quote(str(source))} {shlex.quote(str(symdest))}")
+check("a symlink at the destination is replaced, not written through",
+      rc == 0 and fdvictim.read_text() == "precious" and not symdest.is_symlink())
+
+rc, _ = run(f"install_through_fd /nonexistent/source {shlex.quote(str(fddir / 'never'))}")
+check("install_through_fd fails cleanly when the source is missing", rc != 0)
+check("install_through_fd leaves no temporary files behind",
+      sorted(p.name for p in fddir.iterdir()) == ["plain", "source", "symdest"],
+      str(sorted(p.name for p in fddir.iterdir())))
+
 # ---- and that install.sh actually routes through them -----------------------
 
 check("install.sh guards the symlink it creates",
       '! link_is_ours "$BIN_LINK"' in SH)
 check("install.sh guards the completion it installs",
       '! file_is_ours "$COMPLETION"' in SH)
-check("install.sh stages the completion in an exclusive temporary file",
-      'mktemp "${COMPLETION%/*}/' in SH and 'mv -f "$tmp" "$COMPLETION"' in SH)
+check("install.sh installs the completion through a held descriptor",
+      'install_through_fd "$SCRIPT_DIR/completions/wattage" "$COMPLETION"' in SH)
+check("the staged file is written and chmodded through the descriptor",
+      "cat -- \"$src\" >&9" in HELPERS and "chmod 0644 /proc/self/fd/9" in HELPERS,
+      "naming the file again between steps is the race being closed")
+check("the staged file's identity is checked before the rename",
+      "stat -Lc '%d:%i' /proc/self/fd/9" in HELPERS and "stat -c '%d:%i'" in HELPERS)
 check("install.sh no longer uses a predictable staging name",
-      'install -m 0644 "$SCRIPT_DIR/completions/' not in SH,
+      'install -m 0644 "$SCRIPT_DIR/completions/' not in SH and '"$COMPLETION.new"' not in SH,
       "a fixed $COMPLETION.new can be pre-created as a symlink or a FIFO")
 check("uninstall proves ownership before removing the symlink",
       re.search(r'if link_is_ours "\$BIN_LINK"; then\s+rm -f', SH) is not None)
@@ -216,10 +265,15 @@ check("a marker-less unit carrying the current description is not ours either",
       "every unit this version writes is marked, so an unmarked one is not ours")
 
 src = (ROOT / "bin/wattage").read_text()
-check("the unit is staged in an exclusive temporary file",
-      "tempfile.mkstemp(" in src and 'prefix=".wattage.service."' in src)
-check("the staged unit is renamed into place",
-      "os.replace(tmpname, unit)" in src)
+check("the unit is staged in an exclusive temporary file", "tempfile.mkstemp(" in src)
+check("the staged unit's mode is set through the descriptor, not its name",
+      "os.fchmod(fh.fileno(), mode)" in src and "os.chmod(tmp" not in src,
+      "chmod by name re-resolves a path another process can have swapped")
+check("the rename is directory-descriptor relative",
+      "os.replace(tmpname, name, src_dir_fd=dfd, dst_dir_fd=dfd)" in src)
+check("the staged unit's identity is verified before the rename",
+      "os.stat(tmpname, dir_fd=dfd, follow_symlinks=False)" in src
+      and "!= created:" in src)
 check("the unit no longer uses a predictable staging name",
       'unit_dir / "wattage.service.new"' not in src,
       "a fixed name can be pre-created as a symlink or a FIFO")
