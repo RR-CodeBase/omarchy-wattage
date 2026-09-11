@@ -136,8 +136,11 @@ check("install.sh guards the symlink it creates",
       '! link_is_ours "$BIN_LINK"' in SH)
 check("install.sh guards the completion it installs",
       '! file_is_ours "$COMPLETION"' in SH)
-check("install.sh stages the completion rather than writing through the target",
-      '"$COMPLETION.new"' in SH and 'mv -f "$COMPLETION.new" "$COMPLETION"' in SH)
+check("install.sh stages the completion in an exclusive temporary file",
+      'mktemp "${COMPLETION%/*}/' in SH and 'mv -f "$tmp" "$COMPLETION"' in SH)
+check("install.sh no longer uses a predictable staging name",
+      'install -m 0644 "$SCRIPT_DIR/completions/' not in SH,
+      "a fixed $COMPLETION.new can be pre-created as a symlink or a FIFO")
 check("uninstall proves ownership before removing the symlink",
       re.search(r'if link_is_ours "\$BIN_LINK"; then\s+rm -f', SH) is not None)
 check("uninstall proves ownership before removing the completion",
@@ -158,40 +161,75 @@ loader.exec_module(wattage)
 units = SB / "units"
 units.mkdir()
 
+CANON_CLI = "/home/someone/.config/omarchy/plugins/" + PLUGIN_ID + "/bin/wattage"
+
 check("an absent unit reads as absent, not as somebody else's",
-      wattage.unit_is_ours(units / "wattage.service") is None)
+      wattage.unit_is_ours(units / "wattage.service", CANON_CLI) is None)
 
 foreign_unit = units / "foreign.service"
 foreign_unit.write_text("[Service]\nExecStart=/usr/bin/something-else\n")
 check("a unit somebody else wrote is refused",
-      wattage.unit_is_ours(foreign_unit) is False)
+      wattage.unit_is_ours(foreign_unit, CANON_CLI) is False)
 
 symunit = units / "sym.service"
 symunit.symlink_to(foreign_unit)
 check("a symlinked unit is refused rather than followed",
-      wattage.unit_is_ours(symunit) is False)
+      wattage.unit_is_ours(symunit, CANON_CLI) is False)
 
 marked_unit = units / "marked.service"
 marked_unit.write_text(wattage.UNIT_MARK + "\n[Service]\nExecStart=/x\n")
 check("a unit we wrote is recognised by its marker",
-      wattage.unit_is_ours(marked_unit) is True)
+      wattage.unit_is_ours(marked_unit, CANON_CLI) is True)
+
+buried = units / "buried.service"
+buried.write_text("[Service]\nExecStart=/usr/bin/other\n" + wattage.UNIT_MARK + "\n")
+check("a foreign unit quoting the marker further down is not ours",
+      wattage.unit_is_ours(buried, CANON_CLI) is False,
+      "the marker is only a claim on the first line, where we write it")
 
 legacy_unit = units / "legacy.service"
-legacy_unit.write_text(
-    "[Service]\nExecStart=/home/someone/.config/omarchy/plugins/"
-    + PLUGIN_ID + "/bin/wattage sample --daemon\n")
-check("a marker-less unit from 0.1.0 is still recognised as ours",
-      wattage.unit_is_ours(legacy_unit) is True,
+legacy_unit.write_text(wattage.unit_body(CANON_CLI, wattage.LEGACY_UNIT_DESCRIPTION))
+check("a marker-less 0.1.0 unit for this install is recognised as ours",
+      wattage.unit_is_ours(legacy_unit, CANON_CLI) is True,
       "otherwise an upgrade would refuse to touch its own unit")
 
+# The finding: an ExecStart that merely *ends* with the right words is not
+# proof. /opt/custom/bin/wattage is a different program with the same basename.
+impostor = units / "impostor.service"
+impostor.write_text(
+    wattage.unit_body("/opt/custom/bin/wattage", wattage.LEGACY_UNIT_DESCRIPTION))
+check("a foreign CLI with the same basename is not accepted as ours",
+      wattage.unit_is_ours(impostor, CANON_CLI) is False,
+      "/opt/custom/bin/wattage sample --daemon must not look like our unit")
+
+edited = units / "edited.service"
+edited.write_text(
+    wattage.unit_body(CANON_CLI, wattage.LEGACY_UNIT_DESCRIPTION).replace("Nice=19", "Nice=0"))
+check("a marker-less unit the user has edited is left alone",
+      wattage.unit_is_ours(edited, CANON_CLI) is False,
+      "only the exact contents 0.1.0 wrote count as proof")
+
+renamed_desc = units / "renamed.service"
+renamed_desc.write_text(wattage.unit_body(CANON_CLI, wattage.UNIT_DESCRIPTION))
+check("a marker-less unit carrying the current description is not ours either",
+      wattage.unit_is_ours(renamed_desc, CANON_CLI) is False,
+      "every unit this version writes is marked, so an unmarked one is not ours")
+
 src = (ROOT / "bin/wattage").read_text()
-check("the unit is staged and renamed rather than written in place",
-      "wattage.service.new" in src and "os.replace(tmp, unit)" in src)
+check("the unit is staged in an exclusive temporary file",
+      "tempfile.mkstemp(" in src and 'prefix=".wattage.service."' in src)
+check("the staged unit is renamed into place",
+      "os.replace(tmpname, unit)" in src)
+check("the unit no longer uses a predictable staging name",
+      'unit_dir / "wattage.service.new"' not in src,
+      "a fixed name can be pre-created as a symlink or a FIFO")
+check("the staging descriptor is checked before it is written through",
+      "os.fstat(fh.fileno())" in src and "stat.S_ISREG(st.st_mode)" in src)
 check("the unit is opened no-follow", "os.O_NOFOLLOW" in src)
 check("service install refuses a unit that is not ours",
-      "if unit_is_ours(unit) is False:" in src)
+      "if unit_is_ours(unit, cli) is False:" in src)
 check("service remove leaves a unit that is not ours alone",
-      "owned = unit_is_ours(unit)" in src)
+      "owned = unit_is_ours(unit, cli)" in src)
 
 # ---- report -----------------------------------------------------------------
 
